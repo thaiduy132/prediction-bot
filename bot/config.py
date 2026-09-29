@@ -38,8 +38,16 @@ class SettlementConfig(_Strict):
     price_source: str = "binance_spot_kline"
 
 
+# Binance's public market-data mirrors. Same data as api/stream.binance.com, but
+# they don't apply the region block (HTTP 451) that the main hosts return in some
+# locations (e.g. US cloud servers). Only public data is served there, which is
+# all this bot reads; signed endpoints will need the main hosts.
+MARKET_DATA_REST_URL = "https://data-api.binance.vision"
+MARKET_DATA_WS_URL = "wss://data-stream.binance.vision:443"
+
+
 class WebSocketConfig(_Strict):
-    base_url: str = "wss://stream.binance.com:9443"
+    base_url: str = MARKET_DATA_WS_URL
     kline_intervals: list[str] = Field(default_factory=lambda: ["1m", "5m"])
     book_ticker: bool = True
     backoff_initial_s: float = Field(1.0, gt=0)
@@ -55,7 +63,7 @@ class WebSocketConfig(_Strict):
 
 
 class RestConfig(_Strict):
-    base_url: str = "https://api.binance.com"
+    base_url: str = MARKET_DATA_REST_URL
     timeout_s: float = Field(10.0, gt=0)
     max_retries: int = Field(5, ge=0)
 

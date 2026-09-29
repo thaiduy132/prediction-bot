@@ -25,7 +25,7 @@ class BinanceRestError(RuntimeError):
 class BinanceRestClient:
     def __init__(
         self,
-        base_url: str = "https://api.binance.com",
+        base_url: str = "https://data-api.binance.vision",
         timeout_s: float = 10.0,
         max_retries: int = 5,
         client: httpx.AsyncClient | None = None,
@@ -74,6 +74,11 @@ class BinanceRestClient:
                 await self._sleep(wait)
                 delay = min(delay * 2, 30.0)
                 continue
+            if resp.status_code == 451:
+                raise BinanceRestError(
+                    f"GET {path}: HTTP 451, Binance blocks this location on {self._client.base_url}. "
+                    "Use rest.base_url: https://data-api.binance.vision (public market data mirror)."
+                )
             raise BinanceRestError(f"GET {path}: HTTP {resp.status_code} {resp.text[:200]}")
         raise AssertionError("unreachable")
 

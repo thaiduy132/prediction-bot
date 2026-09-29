@@ -19,7 +19,8 @@ settlement:
   price_source: binance_spot_kline   # chỉ nguồn này được hỗ trợ hiện tại
 
 websocket:
-  base_url: wss://stream.binance.com:9443
+  # mirror dữ liệu công khai của Binance; stream.binance.com:9443 bị chặn (HTTP 451) ở một số vùng
+  base_url: wss://data-stream.binance.vision:443
   kline_intervals: [1m, 5m]
   book_ticker: true
   backoff_initial_s: 1.0
@@ -31,7 +32,8 @@ websocket:
   max_connection_age_s: 84600 # 23.5h; Binance tự ngắt sau 24h
 
 rest:
-  base_url: https://api.binance.com
+  # mirror dữ liệu công khai của Binance; api.binance.com bị chặn (HTTP 451) ở một số vùng
+  base_url: https://data-api.binance.vision
   timeout_s: 10
   max_retries: 5
 
