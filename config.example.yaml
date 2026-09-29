@@ -21,8 +21,10 @@ settlement:
 websocket:
   # mirror dữ liệu công khai của Binance; stream.binance.com:9443 bị chặn (HTTP 451) ở một số vùng
   base_url: wss://data-stream.binance.vision:443
-  kline_intervals: [1m, 5m]
+  kline_intervals: [1s, 1m, 5m]   # 1s -> nến giây (gộp thành 30s ở bước sau)
   book_ticker: true
+  depth_levels: 20            # 0 | 5 | 10 | 20: order book nông (cần cho imbalance)
+  depth_speed_ms: 100         # 100 | 1000
   backoff_initial_s: 1.0
   backoff_max_s: 60.0
   backoff_factor: 2.0
@@ -39,6 +41,37 @@ rest:
 
 data:
   cache_path: data/klines.sqlite
+  book_path: data/book.sqlite   # mẫu order book 1 giây/lần, ghi bằng `data record` hoặc `ui`
+
+backtest:
+  strategy: momentum        # momentum | reversal | always_up | book | momentum_book
+  decision_s: 270           # đặt lệnh sau khi vòng mở 270s (còn 30s)
+  min_move_bps: 1.0         # momentum/reversal: bỏ qua nếu |biến động| nhỏ hơn
+  # !!! PHẢI ĐỐI CHIẾU tỷ lệ thắng thực của thị trường (lãi ròng trên 1 đơn vị cược khi thắng).
+  # 0.9 chỉ là giá trị tạm; PnL sai nếu không khớp thực tế.
+  payout_ratio: 0.9
+  # Chế độ odds (`run --mode backtest --odds`): giá vào lệnh lấy từ odds Predict.fun đã ghi
+  # (`data record-odds`), thay cho payout_ratio. Phí và đặt lệnh là của Binance.
+  use_odds: false
+  fee_bps: 0                # phí Binance tính trên tiền cược mỗi lệnh; điền phí thật, 0 sẽ làm kết quả đẹp hơn thực tế
+  max_entry_price: 1.0      # bỏ qua lệnh có giá mua/cổ phiếu cao hơn mức này (vd 0.9)
+  # chiến lược order book (cần dữ liệu đã ghi bằng `python -m bot data record`)
+  book_levels: 10           # 1 | 5 | 10 | 20 mức giá dùng tính imbalance
+  book_window_s: 10         # lấy trung bình imbalance trong N giây cuối
+  min_imbalance: 0.2        # |imbalance| tối thiểu để vào lệnh (0..1)
+  max_spread_bps: 2.0       # bỏ qua khi spread rộng hơn mức này
+  trades_path: data/backtest_trades.jsonl
+
+predict:
+  # Predict.fun = sàn đứng sau Prediction Market của Binance Wallet.
+  # testnet không cần key nhưng KHÔNG có thanh khoản cho vòng BTC; odds thật cần mainnet + PREDICT_API_KEY.
+  base_url: https://api-testnet.predict.fun   # mainnet: https://api.predict.fun
+  poll_interval_s: 1.0                        # mainnet giới hạn mặc định 240 req/phút
+  timeout_s: 10
+  odds_path: data/odds.sqlite
+
+paper:
+  trades_path: data/paper.sqlite   # lệnh giả lập (paper), giữ lại giữa các lần chạy
 
 logging:
   level: INFO

@@ -17,6 +17,7 @@ class Secrets:
     jev_api_key: SecretStr | None
     binance_api_key: SecretStr | None
     binance_api_secret: SecretStr | None
+    predict_api_key: SecretStr | None  # only needed for the Predict.fun mainnet
 
 
 def _get(name: str) -> SecretStr | None:
@@ -34,4 +35,5 @@ def load_secrets(env_file: str | Path = ".env") -> Secrets:
         jev_api_key=_get("JEV_API_KEY"),
         binance_api_key=_get("BINANCE_API_KEY"),
         binance_api_secret=_get("BINANCE_API_SECRET"),
+        predict_api_key=_get("PREDICT_API_KEY"),
     )

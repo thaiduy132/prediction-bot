@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Price Monitor</title>
+<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+  :root {
+    --bg: #0f1216; --panel: #171b21; --line: #262c35; --text: #e6e9ee; --dim: #8a94a3;
+    --up: #2ebd85; --down: #f6465d; --warn: #f0b90b;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, sans-serif; }
+  header { display: flex; align-items: baseline; gap: 24px; padding: 14px 20px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  .sym { font-weight: 600; color: var(--dim); }
+  .price { font-size: 32px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .price.up { color: var(--up); } .price.down { color: var(--down); }
+  .kv { color: var(--dim); font-variant-numeric: tabular-nums; }
+  .kv b { color: var(--text); font-weight: 500; }
+  .status { margin-left: auto; display: flex; align-items: center; gap: 6px; color: var(--dim); }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--down); }
+  .dot.ok { background: var(--up); }
+  main { display: grid; grid-template-columns: 1fr 300px; gap: 16px; padding: 16px 20px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 10px; }
+  .tabs button { background: transparent; color: var(--dim); border: 1px solid var(--line); border-radius: 6px; padding: 4px 12px; cursor: pointer; }
+  .tabs button.on { color: var(--text); border-color: var(--dim); background: var(--line); }
+  #chart { height: 520px; }
+  h2 { margin: 0 0 10px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--dim); font-weight: 600; }
+  .side { display: flex; flex-direction: column; gap: 16px; }
+  .big { font-size: 28px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .row { display: flex; justify-content: space-between; padding: 3px 0; color: var(--dim); font-variant-numeric: tabular-nums; }
+  .row b { color: var(--text); font-weight: 500; }
+  .up { color: var(--up); } .down { color: var(--down); } .void { color: var(--warn); }
+  .bar { display: flex; height: 8px; border-radius: 4px; overflow: hidden; margin: 6px 0; background: var(--line); }
+  .bar i { display: block; } .bar .b { background: var(--up); } .bar .a { background: var(--down); }
+  .progress { height: 4px; background: var(--line); border-radius: 2px; margin-top: 8px; }
+  .progress i { display: block; height: 100%; background: var(--dim); border-radius: 2px; }
+  .hist { display: flex; gap: 4px; flex-wrap: wrap; }
+  .hist span { padding: 2px 8px; border-radius: 4px; font-size: 12px; background: var(--line); }
+  .hist span.up { color: var(--up); } .hist span.down { color: var(--down); }
+  .paper { padding: 0 20px 24px; }
+  .paper[hidden] { display: none; }
+  .phead { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 12px; }
+  .phead h2 { margin: 0; }
+  .tag { margin-left: 8px; padding: 1px 8px; border-radius: 4px; background: var(--line); color: var(--warn); font-size: 11px; text-transform: none; letter-spacing: 0; }
+  .tiles { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-bottom: 14px; }
+  @media (max-width: 900px) { .tiles { grid-template-columns: repeat(2, 1fr); } }
+  .tile { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  .tile span { display: block; color: var(--dim); font-size: 12px; }
+  .tile b { display: block; font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .tile small { color: var(--dim); font-variant-numeric: tabular-nums; }
+  .prow { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 14px; }
+  @media (max-width: 900px) { .prow { grid-template-columns: 1fr; } }
+  #pCurve { width: 100%; height: 140px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; }
+  .pos { padding: 8px 10px; border-radius: 6px; background: var(--bg); border: 1px solid var(--line); margin-bottom: 6px; }
+  .pos.win { border-color: var(--up); } .pos.lose { border-color: var(--down); }
+  .tablewrap { max-height: 360px; overflow: auto; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 5px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { position: sticky; top: 0; background: var(--panel); color: var(--dim); font-weight: 600; font-size: 12px; }
+  th:first-child, td:first-child { text-align: left; }
+  .muted { color: var(--dim); }
+</style>
+</head>
+<body>
+<header>
+  <span class="sym" id="sym">—</span>
+  <span class="price" id="price">—</span>
+  <span class="kv">Bid <b id="bid">—</b></span>
+  <span class="kv">Ask <b id="ask">—</b></span>
+  <span class="kv">Spread <b id="spread">—</b></span>
+  <span class="status"><i class="dot" id="dot"></i><span id="statusText">connecting…</span></span>
+</header>
+<main>
+  <section class="panel">
+    <div class="tabs" id="tabs"></div>
+    <div id="chart"></div>
+  </section>
+  <aside class="side">
+    <div class="panel">
+      <h2 id="roundTitle">Current round</h2>
+      <div class="big" id="roundOutcome">—</div>
+      <div class="row">Open <b id="rOpen">—</b></div>
+      <div class="row">Now <b id="rNow">—</b></div>
+      <div class="row">Change <b id="rDelta">—</b></div>
+      <div class="row">Time left <b id="rLeft">—</b></div>
+      <div class="progress"><i id="rBar" style="width:0"></i></div>
+    </div>
+    <div class="panel">
+      <h2>Top of book</h2>
+      <div class="row">Bid qty <b id="bq">—</b></div>
+      <div class="row">Ask qty <b id="aq">—</b></div>
+      <div class="bar"><i class="b" id="imbB" style="width:50%"></i><i class="a" id="imbA" style="width:50%"></i></div>
+      <div class="row">Imbalance (top) <b id="imb">—</b></div>
+      <div class="row">Depth imb. 5 lv <b id="di5">—</b></div>
+      <div class="row">Depth imb. 10 lv <b id="di10">—</b></div>
+      <div class="row">Depth imb. 20 lv <b id="di20">—</b></div>
+    </div>
+    <div class="panel">
+      <h2>Last rounds</h2>
+      <div class="hist" id="hist"></div>
+    </div>
+  </aside>
+</main>
+
+<section class="paper" id="paperSec" hidden>
+  <div class="panel">
+    <div class="phead">
+      <h2>Paper trading <span class="tag">simulated · no real orders</span></h2>
+      <span class="kv" id="pMeta"></span>
+    </div>
+    <div class="tiles">
+      <div class="tile"><span>Total PnL (units of stake)</span><b id="pPnl">0.000</b><small id="pRoi">&nbsp;</small></div>
+      <div class="tile"><span>Bets</span><b id="pBets">0</b><small id="pWL">&nbsp;</small></div>
+      <div class="tile"><span>Win rate</span><b id="pWin">—</b><small id="pBE">&nbsp;</small></div>
+      <div class="tile"><span>Max drawdown</span><b id="pDD">—</b><small id="pP">&nbsp;</small></div>
+      <div class="tile"><span>Avg entry price</span><b id="pAvg">—</b><small id="pSkip">&nbsp;</small></div>
+    </div>
+    <div class="prow">
+      <div>
+        <h2>Now</h2>
+        <div id="pOpen"></div>
+        <div class="row">Odds Up (bid / ask) <b id="pOdds">—</b></div>
+        <div class="row">Next decision in <b id="pNext">—</b></div>
+        <div class="row">Last decision <b id="pLast">—</b></div>
+      </div>
+      <div>
+        <h2>Cumulative PnL</h2>
+        <svg id="pCurve" viewBox="0 0 600 140" preserveAspectRatio="none"></svg>
+      </div>
+    </div>
+    <h2>Trades</h2>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Round (local)</th><th>Side</th><th>Entry price</th><th>Result</th><th>PnL</th><th>Cumulative</th></tr></thead>
+        <tbody id="pRows"><tr><td colspan="6" class="muted">No trades yet</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<script>
+const $ = id => document.getElementById(id);
+const state = { paper: null, interval: null, candles: {}, rule: 'close_gte_open', roundSec: 300, roundInterval: '5m',
+                last: null, prev: null, book: null };
+let chart, series;
+
+function fmt(n, d = 2) { return n == null ? '—' : Number(n).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d }); }
+
+function outcome(open, close) {
+  if (close === open) return state.rule === 'tie_void' ? 'VOID' : state.rule === 'close_gt_open' ? 'DOWN' : 'UP';
+  return close > open ? 'UP' : 'DOWN';
+}
+
+function initChart() {
+  chart = LightweightCharts.createChart($('chart'), {
+    layout: { background: { color: 'transparent' }, textColor: '#8a94a3' },
+    grid: { vertLines: { color: '#1f242c' }, horzLines: { color: '#1f242c' } },
+    timeScale: { timeVisible: true, secondsVisible: true, borderColor: '#262c35' },
+    rightPriceScale: { borderColor: '#262c35' },
+    autoSize: true,
+  });
+  series = chart.addCandlestickSeries({
+    upColor: '#2ebd85', downColor: '#f6465d', wickUpColor: '#2ebd85', wickDownColor: '#f6465d', borderVisible: false,
+  });
+}
+
+function setInterval_(iv) {
+  state.interval = iv;
+  document.querySelectorAll('#tabs button').forEach(b => b.classList.toggle('on', b.dataset.iv === iv));
+  series.setData((state.candles[iv] || []).map(c => ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close })));
+  chart.timeScale().fitContent();
+}
+
+function setPrice(p) {
+  if (p == null) return;
+  state.prev = state.last; state.last = p;
+  const el = $('price');
+  el.textContent = fmt(p);
+  if (state.prev != null && p !== state.prev) el.className = 'price ' + (p > state.prev ? 'up' : 'down');
+  renderRound();
+}
+
+function renderBook() {
+  const b = state.book; if (!b) return;
+  $('bid').textContent = fmt(b.bid); $('ask').textContent = fmt(b.ask);
+  $('spread').textContent = fmt(b.ask - b.bid);
+  $('bq').textContent = fmt(b.bid_qty, 4); $('aq').textContent = fmt(b.ask_qty, 4);
+  const tot = b.bid_qty + b.ask_qty, r = tot ? b.bid_qty / tot : 0.5;
+  $('imbB').style.width = (r * 100) + '%'; $('imbA').style.width = ((1 - r) * 100) + '%';
+  $('imb').textContent = fmt((b.bid_qty - b.ask_qty) / (tot || 1), 3);
+  setPrice((b.bid + b.ask) / 2);
+}
+
+const sgn = (v, d = 3) => (v > 0 ? '+' : '') + fmt(v, d);
+const cls = v => v > 0 ? 'up' : v < 0 ? 'down' : '';
+const hhmm = ms => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+const mmss = sec => { sec = Math.max(0, Math.floor(sec)); return Math.floor(sec / 60) + ':' + String(sec % 60).padStart(2, '0'); };
+
+function renderCurve(curve) {
+  const svg = $('pCurve');
+  if (!curve.length) { svg.innerHTML = '<text x="300" y="75" fill="#8a94a3" text-anchor="middle" font-size="14">no trades yet</text>'; return; }
+  const pts = [0, ...curve], lo = Math.min(...pts), hi = Math.max(...pts), span = (hi - lo) || 1;
+  const x = i => 10 + (580 * i) / Math.max(1, pts.length - 1), y = v => 130 - (120 * (v - lo)) / span;
+  const line = pts.map((v, i) => x(i).toFixed(1) + ',' + y(v).toFixed(1)).join(' ');
+  const last = pts[pts.length - 1], color = last >= 0 ? '#2ebd85' : '#f6465d';
+  svg.innerHTML = `<line x1="0" x2="600" y1="${y(0)}" y2="${y(0)}" stroke="#262c35" stroke-dasharray="4 4"/>` +
+    `<polyline points="${line}" fill="none" stroke="${color}" stroke-width="2" vector-effect="non-scaling-stroke"/>`;
+}
+
+function renderPaper() {
+  const p = state.paper;
+  $('paperSec').hidden = !p;
+  if (!p) return;
+  const s = p.stats;
+  $('pMeta').textContent = `${p.strategy} · bet at ${p.decision_s}s · ` +
+    (p.pricing === 'odds' ? 'Predict.fun odds' : 'fixed payout ' + p.payout_ratio) +
+    ` · fee ${p.fee_bps} bps` + (p.max_entry_price < 1 ? ` · max price ${p.max_entry_price}` : '');
+  const pnl = s.pnl_units || 0;
+  $('pPnl').textContent = sgn(pnl); $('pPnl').className = cls(pnl);
+  $('pRoi').textContent = s.roi_per_bet == null ? '' : 'ROI/bet ' + sgn(s.roi_per_bet * 100, 1) + '%';
+  $('pBets').textContent = s.bets; $('pWL').textContent = `${s.wins}W · ${s.losses}L` + (s.voids ? ` · ${s.voids} void` : '');
+  $('pWin').textContent = s.win_rate == null ? '—' : fmt(s.win_rate * 100, 1) + '%';
+  $('pBE').textContent = s.bets ? 'break-even ' + fmt(s.breakeven_win_rate * 100, 1) + '%' : '';
+  $('pDD').textContent = s.bets ? fmt(s.max_drawdown_units, 3) : '—';
+  $('pP').textContent = s.bets ? 'p-value ' + fmt(s.p_value_vs_breakeven, 3) : '';
+  $('pAvg').textContent = s.avg_entry_price == null ? '—' : fmt(s.avg_entry_price, 3);
+  const sk = Object.entries(p.skipped || {}).map(([k, v]) => `${k.replace(/_/g, ' ')} ${v}`).join(', ');
+  $('pSkip').textContent = sk ? 'skipped: ' + sk : '';
+
+  const now = Date.now(), cur = (state.candles[state.roundInterval] || []).slice(-1)[0];
+  $('pOpen').innerHTML = p.open.length ? p.open.map(b => {
+    const win = cur && state.last != null && cur.time * 1000 === b.round_open ? outcome(cur.open, state.last) === b.side : null;
+    return `<div class="pos ${win === true ? 'win' : win === false ? 'lose' : ''}"><b class="${b.side.toLowerCase()}">${b.side}</b> @ ` +
+      `${b.entry_price == null ? 'fixed payout' : fmt(b.entry_price, 2)} · settles in ${mmss((b.ends_at - now) / 1000)}` +
+      (win === null ? '' : win ? ' · <span class="up">currently winning</span>' : ' · <span class="down">currently losing</span>') + '</div>';
+  }).join('') : '<div class="pos muted">No open position</div>';
+  const o = p.odds;
+  $('pOdds').textContent = o ? `${o.up_bid ?? '—'} / ${o.up_ask ?? '—'}` + (now - o.ts > 5000 ? ' (stale)' : '') : (p.pricing === 'odds' ? 'waiting…' : 'n/a');
+  $('pNext').textContent = mmss((p.next_decision_at - now) / 1000);
+  const d = p.last_decision;
+  $('pLast').textContent = d ? `${hhmm(d.round_open)} → ${d.result}` : '—';
+
+  renderCurve(p.curve);
+  $('pRows').innerHTML = p.trades.length ? p.trades.slice().reverse().map(t =>
+    `<tr><td>${hhmm(t.round_open)}</td><td class="${t.side.toLowerCase()}">${t.side}</td>` +
+    `<td>${t.entry_price == null ? '—' : fmt(t.entry_price, 2)}</td><td class="${t.outcome === t.side ? 'up' : t.outcome === 'VOID' ? 'void' : 'down'}">${t.outcome === t.side ? 'WIN' : t.outcome === 'VOID' ? 'VOID' : 'LOSS'}</td>` +
+    `<td class="${cls(t.pnl)}">${sgn(t.pnl)}</td><td class="${cls(t.cum_pnl)}">${sgn(t.cum_pnl)}</td></tr>`).join('')
+    : '<tr><td colspan="6" class="muted">No trades yet</td></tr>';
+}
+
+function renderDepth(imb) {
+  if (!imb) return;
+  for (const n of ['5', '10', '20']) {
+    const el = $('di' + n), v = imb[n];
+    el.textContent = (v >= 0 ? '+' : '') + fmt(v, 3);
+    el.className = v > 0.05 ? 'up' : v < -0.05 ? 'down' : '';
+  }
+}
+
+function renderRound() {
+  const list = state.candles[state.roundInterval] || [];
+  const cur = list[list.length - 1];
+  if (!cur || state.last == null) return;
+  const now = Date.now() / 1000, end = cur.time + state.roundSec;
+  const left = Math.max(0, end - now), delta = state.last - cur.open;
+  const o = outcome(cur.open, state.last);
+  $('rOpen').textContent = fmt(cur.open); $('rNow').textContent = fmt(state.last);
+  $('rDelta').textContent = (delta >= 0 ? '+' : '') + fmt(delta);
+  $('rDelta').className = delta > 0 ? 'up' : delta < 0 ? 'down' : '';
+  $('roundOutcome').textContent = o; $('roundOutcome').className = 'big ' + o.toLowerCase();
+  const m = Math.floor(left / 60), s = Math.floor(left % 60);
+  $('rLeft').textContent = m + ':' + String(s).padStart(2, '0');
+  $('rBar').style.width = (100 * (1 - left / state.roundSec)) + '%';
+  $('roundTitle').textContent = 'Current ' + state.roundInterval + ' round';
+}
+
+function renderHist() {
+  const closed = (state.candles[state.roundInterval] || []).filter(c => c.closed).slice(-16).reverse();
+  $('hist').innerHTML = closed.map(c => {
+    const o = outcome(c.open, c.close);
+    return `<span class="${o.toLowerCase()}" title="${new Date(c.time * 1000).toISOString()}">${o}</span>`;
+  }).join('');
+}
+
+function upsert(iv, c) {
+  const list = state.candles[iv] || (state.candles[iv] = []);
+  const last = list[list.length - 1];
+  if (last && last.time === c.time) list[list.length - 1] = c;
+  else if (!last || c.time > last.time) list.push(c);
+  else { const i = list.findIndex(x => x.time === c.time); if (i >= 0) list[i] = c; else { list.push(c); list.sort((a, b) => a.time - b.time); } }
+}
+
+function setStatus(ok, text) { $('dot').className = 'dot' + (ok ? ' ok' : ''); $('statusText').textContent = text; }
+
+function connect() {
+  const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+  ws.onopen = () => setStatus(false, 'waiting for data…');
+  ws.onclose = () => { setStatus(false, 'dashboard disconnected, retrying…'); setTimeout(connect, 2000); };
+  ws.onmessage = ev => {
+    const m = JSON.parse(ev.data);
+    switch (m.t) {
+      case 'snapshot': {
+        state.candles = m.candles; state.rule = m.rule; state.roundSec = m.round_seconds;
+        state.roundInterval = m.round_interval; state.book = m.book;
+        $('sym').textContent = m.symbol;
+        setStatus(m.connected, m.connected ? 'live' : 'feed reconnecting…');
+        $('tabs').innerHTML = Object.keys(m.candles).map(iv => `<button data-iv="${iv}">${iv}</button>`).join('');
+        document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => setInterval_(b.dataset.iv));
+        const keep = state.interval in m.candles ? state.interval : (m.candles[m.round_interval] ? m.round_interval : Object.keys(m.candles)[0]);
+        setInterval_(keep);
+        const s1 = m.candles['1s'] || m.candles['1m'] || [];
+        if (s1.length) setPrice(s1[s1.length - 1].close);
+        state.paper = m.paper;
+        renderBook(); renderDepth(m.depth_imb); renderRound(); renderHist(); renderPaper();
+        break;
+      }
+      case 'kline': {
+        upsert(m.interval, m.candle);
+        if (m.interval === state.interval) {
+          const c = m.candle; series.update({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close });
+        }
+        if (m.interval === '1s' && !state.book) setPrice(m.candle.close);
+        if (m.interval === state.roundInterval) { renderRound(); if (m.candle.closed) renderHist(); }
+        break;
+      }
+      case 'book': state.book = m; renderBook(); break;
+      case 'depth': renderDepth(m.imb); break;
+      case 'paper': state.paper = m.paper; renderPaper(); break;
+      case 'conn': setStatus(m.connected, m.connected ? 'live' : 'feed reconnecting…'); break;
+    }
+  };
+}
+
+initChart();
+connect();
+setInterval(renderRound, 250);  // countdown ticks between messages
+setInterval(renderPaper, 500);   // paper countdowns and "currently winning" between server pushes
+</script>
+</body>
+</html>

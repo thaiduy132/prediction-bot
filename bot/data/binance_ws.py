@@ -19,7 +19,7 @@ from typing import Any, Protocol
 from bot.config import WebSocketConfig
 from bot.data.gaps import Backoff
 from bot.logging_setup import log_event
-from bot.models import BookTicker, Kline, book_ticker_from_ws, kline_from_ws
+from bot.models import BookTicker, DepthSnapshot, Kline, book_ticker_from_ws, depth_from_ws, kline_from_ws
 from bot.timeutil import now_ms
 
 log = logging.getLogger(__name__)
@@ -39,6 +39,11 @@ class BookTickerEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class DepthEvent:
+    depth: DepthSnapshot
+
+
+@dataclass(frozen=True, slots=True)
 class ConnectionEvent:
     state: str  # "connected" | "disconnected"
     connection_no: int  # 1 for the first successful connection
@@ -55,7 +60,7 @@ class GapEvent:
     expected: int
 
 
-StreamEvent = KlineEvent | BookTickerEvent | ConnectionEvent | GapEvent
+StreamEvent = KlineEvent | BookTickerEvent | DepthEvent | ConnectionEvent | GapEvent
 
 
 # ---- transport ----------------------------------------------------------------
@@ -82,11 +87,14 @@ class _Rotate(Exception):
     pass
 
 
-def build_stream_url(base_url: str, symbol: str, kline_intervals: list[str], book_ticker: bool) -> str:
+def build_stream_url(base_url: str, symbol: str, kline_intervals: list[str], book_ticker: bool,
+                     depth_levels: int = 0, depth_speed_ms: int = 100) -> str:
     s = symbol.lower()
     streams = [f"{s}@kline_{i}" for i in kline_intervals]
     if book_ticker:
         streams.append(f"{s}@bookTicker")
+    if depth_levels:
+        streams.append(f"{s}@depth{depth_levels}@{depth_speed_ms}ms")
     return f"{base_url.rstrip('/')}/stream?streams={'/'.join(streams)}"
 
 
@@ -103,7 +111,8 @@ class BinanceStream:
     ) -> None:
         self.cfg = cfg
         self.symbol = symbol.upper()
-        self.url = build_stream_url(cfg.base_url, symbol, cfg.kline_intervals, cfg.book_ticker)
+        self.url = build_stream_url(cfg.base_url, symbol, cfg.kline_intervals, cfg.book_ticker,
+                                      cfg.depth_levels, cfg.depth_speed_ms)
         self._connect = connect_fn
         self._sleep = sleep
         self._mono = monotonic
@@ -120,6 +129,8 @@ class BinanceStream:
             return KlineEvent(kline_from_ws(data))
         if stream.endswith("@bookTicker"):
             return BookTickerEvent(book_ticker_from_ws(data, self._clock_ms()))
+        if "@depth" in stream:
+            return DepthEvent(depth_from_ws(data, self._clock_ms()))
         return None
 
     async def events(self) -> AsyncIterator[StreamEvent]:

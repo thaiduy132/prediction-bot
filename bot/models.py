@@ -55,6 +55,16 @@ class BookTicker:
         return self.ask - self.bid
 
 
+@dataclass(frozen=True, slots=True)
+class DepthSnapshot:
+    """Partial order book (top N levels) from `<symbol>@depthN@speed`. Bids high->low, asks low->high."""
+
+    last_update_id: int
+    bids: tuple[tuple[float, float], ...]  # (price, qty)
+    asks: tuple[tuple[float, float], ...]
+    recv_time: int  # local receive time, ms (partial-depth payloads carry no event time)
+
+
 def kline_from_rest(row: list[Any], symbol: str, interval: str, now_ms: int) -> Kline:
     """Parse one row of GET /api/v3/klines.
 
@@ -111,5 +121,15 @@ def book_ticker_from_ws(data: dict[str, Any], recv_time: int) -> BookTicker:
         bid_qty=float(data["B"]),
         ask=float(data["a"]),
         ask_qty=float(data["A"]),
+        recv_time=recv_time,
+    )
+
+
+def depth_from_ws(data: dict[str, Any], recv_time: int) -> DepthSnapshot:
+    """Parse the `data` object of a `<symbol>@depth<N>@<speed>` stream message."""
+    return DepthSnapshot(
+        last_update_id=int(data["lastUpdateId"]),
+        bids=tuple((float(p), float(q)) for p, q in data["bids"]),
+        asks=tuple((float(p), float(q)) for p, q in data["asks"]),
         recv_time=recv_time,
     )
