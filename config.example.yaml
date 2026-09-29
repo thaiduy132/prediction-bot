@@ -1,0 +1,43 @@
+# Copy thành config.yaml rồi chỉnh. Secrets (JEV_API_KEY, Binance keys) KHÔNG đặt ở đây, dùng .env.
+# Các khoá không hợp lệ/gõ sai sẽ bị báo lỗi khi load (extra="forbid").
+
+market:
+  symbol: BTCUSDT
+  round_interval: 5m
+
+settlement:
+  # !!! PHẢI ĐỐI CHIẾU với luật chính thức của TỪNG thị trường Binance Prediction Market:
+  #   - hoà (close == open) tính là gì: Up, Down hay hoàn tiền?
+  #   - giá tham chiếu là gì: giá khớp spot, index price hay mark price? Lấy ở giây nào?
+  #   - mốc bắt đầu/kết thúc vòng có trùng với nến 5m của Binance spot không?
+  # Nếu khác, kết quả backtest sẽ bị lệch.
+  #
+  # close_gte_open : close >= open -> UP   (hoà -> UP)   [mặc định]
+  # close_gt_open  : close >  open -> UP   (hoà -> DOWN)
+  # tie_void       : hoà -> VOID (hoàn tiền)
+  rule: close_gte_open
+  price_source: binance_spot_kline   # chỉ nguồn này được hỗ trợ hiện tại
+
+websocket:
+  base_url: wss://stream.binance.com:9443
+  kline_intervals: [1m, 5m]
+  book_ticker: true
+  backoff_initial_s: 1.0
+  backoff_max_s: 60.0
+  backoff_factor: 2.0
+  backoff_jitter: 0.2
+  stable_after_s: 60          # kết nối sống >= 60s thì reset backoff
+  stale_timeout_s: 30         # 30s không có message -> coi là chết, kết nối lại
+  max_connection_age_s: 84600 # 23.5h; Binance tự ngắt sau 24h
+
+rest:
+  base_url: https://api.binance.com
+  timeout_s: 10
+  max_retries: 5
+
+data:
+  cache_path: data/klines.sqlite
+
+logging:
+  level: INFO
+  file: data/bot.log.jsonl
