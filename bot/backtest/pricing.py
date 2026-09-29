@@ -7,9 +7,15 @@ shares. Buying UP costs the ask of the YES book; buying DOWN costs 1 - (best YES
 
 from __future__ import annotations
 
-from bot.backtest.strategy import Side
+from enum import StrEnum
+
 from bot.data.odds_store import OddsSample
 from bot.settlement import Outcome
+
+
+class Side(StrEnum):
+    UP = "UP"
+    DOWN = "DOWN"
 
 
 def entry_price(side: Side, q: OddsSample) -> float | None:

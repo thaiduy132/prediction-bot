@@ -8,17 +8,16 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from enum import StrEnum
 from typing import Protocol
 
+from bot.backtest.calibration import CalibrationTable, sigma_bps, z_score
 from bot.backtest.features import book_features
+from bot.backtest.pricing import Side, entry_price
 from bot.data.book_store import BookSample
+from bot.data.odds_store import OddsSample
 from bot.models import Kline
 
-
-class Side(StrEnum):
-    UP = "UP"
-    DOWN = "DOWN"
+__all__ = ["Side"]  # re-exported: most callers import Side from here
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +27,8 @@ class RoundContext:
     decision_time: int  # ms; every candle in `recent` closed at or before this
     recent: Sequence[Kline]  # closed 1s candles from round open up to decision_time, in order
     book: Sequence[BookSample] = ()  # recorded book samples that were known before decision_time
+    lookback: Sequence[Kline] = ()  # closed 1s candles of the SIGMA_WINDOW_S seconds before decision_time
+    quote: OddsSample | None = None  # latest odds quote known at decision_time (odds mode only)
 
     @property
     def last_price(self) -> float:
@@ -42,6 +43,8 @@ class RoundContext:
 class Strategy(Protocol):
     name: str
     needs_book: bool  # True: rounds without recorded order-book data are skipped
+    # Optional attribute `needs_odds` (default False): the strategy reads ctx.quote, so rounds
+    # without a fresh quote are skipped before it is asked.
 
     def decide(self, ctx: RoundContext) -> Side | None:
         """Return a side to bet on, or None to skip this round."""
@@ -125,6 +128,66 @@ class AlwaysUp:
         return Side.UP
 
 
+@dataclass(frozen=True, slots=True)
+class ValueParams:
+    fee_bps: float = 0.0  # charged on the stake, same as the backtest's fee_bps
+    min_edge: float = 0.03  # required expected profit per unit staked, after the fee
+    min_samples: int = 100  # ignore |z| buckets calibrated on fewer rounds than this
+
+
+@dataclass(frozen=True, slots=True)
+class Value:
+    """Bet only when the market price is below the calibrated win probability.
+
+    p = measured win rate of "follow the move" for this |z| bucket (see bot.backtest.calibration).
+    Expected profit per unit staked on a side that wins with probability q at price c:
+        q / c - 1 - fee
+    Both sides are checked: following the move (q = p) and fading it (q = 1 - p). The better one
+    is taken if it clears `min_edge`; otherwise the round is skipped.
+    """
+
+    table: CalibrationTable
+    params: ValueParams = ValueParams()
+    name: str = "value"
+    needs_book: bool = False
+    needs_odds: bool = True
+
+    def __repr__(self) -> str:  # short and stable: used as the paper-trading history label
+        return f"Value({self.table.label}, {self.params})"
+
+    def estimate(self, ctx: RoundContext) -> tuple[Side, float, float] | None:
+        """(side the move points to, calibrated P(that side wins), z) or None if not estimable."""
+        if (ctx.decision_time - ctx.round_open_time) // 1000 != self.table.decision_s:
+            raise ValueError(f"calibration is for second {self.table.decision_s}, decision is at "
+                             f"{(ctx.decision_time - ctx.round_open_time) // 1000}")
+        sig = sigma_bps(ctx.lookback)
+        move = ctx.move_bps
+        if sig is None or move == 0:
+            return None
+        z = z_score(move, sig, self.table.round_s - self.table.decision_s)
+        b = self.table.lookup(abs(z))
+        if b.n < self.params.min_samples:
+            return None
+        return (Side.UP if move > 0 else Side.DOWN), b.rate, z
+
+    def decide(self, ctx: RoundContext) -> Side | None:
+        est = self.estimate(ctx)
+        if est is None or ctx.quote is None:
+            return None
+        follow, p, _ = est
+        fade = Side.DOWN if follow is Side.UP else Side.UP
+        fee = self.params.fee_bps / 10_000
+        best: tuple[Side, float] | None = None
+        for side, q in ((follow, p), (fade, 1.0 - p)):
+            price = entry_price(side, ctx.quote)
+            if price is None or not 0 < price < 1:
+                continue
+            ev = q / price - 1 - fee
+            if ev >= self.params.min_edge and (best is None or ev > best[1]):
+                best = (side, ev)
+        return None if best is None else best[0]
+
+
 def make_strategy(name: str, min_move_bps: float, book: BookParams = BookParams()) -> Strategy:
     match name:
         case "momentum":
@@ -137,4 +200,6 @@ def make_strategy(name: str, min_move_bps: float, book: BookParams = BookParams(
             return BookImbalance(book)
         case "momentum_book":
             return MomentumBook(min_move_bps, book)
-    raise ValueError(f"unknown strategy {name!r} (momentum | reversal | always_up | book | momentum_book)")
+        case "value":
+            raise ValueError("the value strategy needs a calibration table: build Value(table, ValueParams(...))")
+    raise ValueError(f"unknown strategy {name!r} (momentum | reversal | always_up | book | momentum_book | value)")

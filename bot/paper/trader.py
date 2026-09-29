@@ -13,6 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from bot.backtest.calibration import SIGMA_WINDOW_S
 from bot.backtest.engine import BacktestResult, Trade, decide_entry
 from bot.backtest.pricing import bet_pnl
 from bot.backtest.stats import summarize
@@ -87,6 +88,13 @@ class PaperTrader:
 
     # ---- inputs ---------------------------------------------------------------------
 
+    def seed_seconds(self, klines: list[Kline]) -> None:
+        """Store past closed 1s candles (e.g. history loaded at startup) without deciding on them,
+        so the volatility lookback is full from the first live round."""
+        for k in klines:
+            if k.interval == "1s" and k.is_closed:
+                self._seconds[k.open_time] = k
+
     def on_book(self, s: BookSample) -> None:
         self._book.append(s)
 
@@ -128,8 +136,10 @@ class PaperTrader:
             self._record_skip(round_open, "no_data")
             return True
         odds = [q for q in self._odds if q.round_start == round_open] if self.use_odds else None
+        lookback = [self._seconds[t] for t in range(decision_time - SIGMA_WINDOW_S * 1000, decision_time, 1000)
+                    if t in self._seconds]
         entry, skip = decide_entry(self.strategy, round_open, px, decision_time, recent, book, odds,
-                                   self.max_entry_price)
+                                   self.max_entry_price, lookback)
         if entry is None:
             self._record_skip(round_open, skip or "unknown")
             return True

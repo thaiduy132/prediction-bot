@@ -10,9 +10,10 @@ import sys
 from collections import Counter
 from dataclasses import dataclass
 
+from bot.backtest.calibration import SIGMA_WINDOW_S, CalibrationTable, build_table, load_table, save_tables
 from bot.backtest.engine import run_backtest
 from bot.backtest.stats import summarize
-from bot.backtest.strategy import BookParams, Strategy, make_strategy
+from bot.backtest.strategy import BookParams, Strategy, Value, ValueParams, make_strategy
 from bot.config import AppConfig, load_config
 from bot.data.binance_rest import BinanceRestClient
 from bot.data.binance_ws import BinanceStream, BookTickerEvent, ConnectionEvent, DepthEvent, GapEvent, KlineEvent
@@ -30,7 +31,7 @@ from bot.timeutil import ceil_to, floor_to, interval_ms, ms_to_iso, now_ms, pars
 log = logging.getLogger("bot")
 
 MODES = ("backtest", "paper", "shadow", "live")
-STRATEGIES = ("momentum", "reversal", "always_up", "book", "momentum_book")
+STRATEGIES = ("momentum", "reversal", "always_up", "book", "momentum_book", "value")
 
 
 def _rest(cfg: AppConfig) -> BinanceRestClient:
@@ -106,15 +107,30 @@ def _strategy_params(cfg: AppConfig, args: argparse.Namespace) -> StrategyParams
         min_imbalance=bt.min_imbalance if args.min_imbalance is None else args.min_imbalance,
         max_spread_bps=bt.max_spread_bps if args.max_spread_bps is None else args.max_spread_bps,
     )
+    decision_s = args.decision_s or bt.decision_s
+    use_odds = args.odds or bt.use_odds
+    fee_bps = bt.fee_bps if args.fee_bps is None else args.fee_bps
+    if name == "value":
+        if not use_odds:
+            raise SystemExit("Chiến lược value so xác suất với giá thị trường, nên cần odds: thêm --odds "
+                             "(hoặc backtest.use_odds: true).")
+        try:
+            table = load_table(bt.calibration_path, decision_s)
+        except (FileNotFoundError, KeyError) as e:
+            raise SystemExit(str(e).strip("'\"")) from None
+        min_edge = bt.min_edge if args.min_edge is None else args.min_edge
+        strategy: Strategy = Value(table, ValueParams(fee_bps, min_edge, bt.min_samples))
+    else:
+        strategy = make_strategy(name, min_move, book_params)
     return StrategyParams(
         name=name,
-        strategy=make_strategy(name, min_move, book_params),
-        decision_s=args.decision_s or bt.decision_s,
+        strategy=strategy,
+        decision_s=decision_s,
         min_move=min_move,
         payout=args.payout or bt.payout_ratio,
         book_params=book_params,
-        use_odds=args.odds or bt.use_odds,
-        fee_bps=bt.fee_bps if args.fee_bps is None else args.fee_bps,
+        use_odds=use_odds,
+        fee_bps=fee_bps,
         max_entry_price=bt.max_entry_price if args.max_entry_price is None else args.max_entry_price,
     )
 
@@ -173,15 +189,24 @@ async def cmd_backtest(cfg: AppConfig, args: argparse.Namespace) -> int:
     try:
         async with _rest(cfg) as rest:
             rounds = await load_klines(rest, cache, sym, rnd, start_ms, end_ms)
-            seconds = await load_klines(rest, cache, sym, "1s", start_ms, end_ms)
+            # the value strategy's volatility lookback reaches SIGMA_WINDOW_S before each decision
+            seconds = await load_klines(rest, cache, sym, "1s", start_ms - SIGMA_WINDOW_S * 1000, end_ms)
     finally:
         cache.close()
+
+    if isinstance(strategy, Value):
+        t = strategy.table
+        if parse_utc(t.start) < end_ms and start_ms < parse_utc(t.end):
+            print(f"CẢNH BÁO: khoảng backtest trùng khoảng hiệu chỉnh ({t.start} .. {t.end}); kết quả sẽ đẹp hơn "
+                  "thực tế. Hãy hiệu chỉnh trên giai đoạn TRƯỚC khoảng backtest.", file=sys.stderr)
 
     res = run_backtest(rounds, seconds, strategy, cfg.settlement.rule, rnd, decision_s, payout, book_samples,
                        odds_samples, fee_bps, max_price)
     summary = {
         "symbol": sym, "range": [ms_to_iso(start_ms), ms_to_iso(end_ms)], "strategy": strategy.name,
         "decision_s": decision_s, "min_move_bps": min_move,
+        **({"calibration": strategy.table.label, "min_edge": strategy.params.min_edge}
+           if isinstance(strategy, Value) else {}),
         **({"pricing": "predict.fun odds", "odds_samples": len(odds_samples), "max_entry_price": max_price}
            if odds_samples is not None else {"pricing": "fixed payout", "payout_ratio": payout}),
         **({"book": {"levels": book_params.levels, "window_s": book_params.window_s,
@@ -223,6 +248,36 @@ def _run_dashboard(cfg: AppConfig, args: argparse.Namespace, secrets: object, pa
         return asyncio.run(cmd_ui(cfg, args.host, args.port, trader, key))
     except KeyboardInterrupt:
         return 0
+
+
+# ---- calibration -----------------------------------------------------------------
+
+async def cmd_data_calibrate(cfg: AppConfig, start: str, end: str, decision_seconds: list[int]) -> int:
+    """Measure win rate of following the move per |z| bucket and save it for the value strategy."""
+    sym, rnd = cfg.market.symbol, cfg.market.round_interval
+    start_ms, end_ms = parse_utc(start), parse_utc(end)
+    cache = KlineCache(cfg.data.cache_path)
+    try:
+        async with _rest(cfg) as rest:
+            seconds = await load_klines(rest, cache, sym, "1s", start_ms - SIGMA_WINDOW_S * 1000, end_ms)
+    finally:
+        cache.close()
+    round_s = interval_ms(rnd) // 1000
+    tables: list[CalibrationTable] = []
+    for d in decision_seconds:
+        t = build_table(seconds, d, cfg.settlement.rule, sym, round_s)
+        t.start, t.end = ms_to_iso(start_ms), ms_to_iso(end_ms)  # the rounds measured, not the lookback
+        tables.append(t)
+        print(f"\n{t.label}  ({round_s - d}s left, rule {t.rule}, {sum(b.n for b in t.buckets)} rounds)")
+        print(f"  {'|z| bucket':>12} {'rounds':>7} {'follow wins':>12} {'break-even price at fee ' + str(cfg.backtest.fee_bps) + 'bps':>36}")
+        for b in t.buckets:
+            if b.n:
+                hi = "inf" if b.hi is None else f"{b.hi:.2f}"
+                print(f"  {b.lo:>5.2f}-{hi:<6} {b.n:>7} {b.rate * 100:>11.1f}% "
+                      f"{b.rate / (1 + cfg.backtest.fee_bps / 10_000):>36.3f}")
+    save_tables(cfg.backtest.calibration_path, tables)
+    print(f"\nsaved -> {cfg.backtest.calibration_path}", file=sys.stderr)
+    return 0
 
 
 # ---- data stream -----------------------------------------------------------------
@@ -334,6 +389,7 @@ def _add_strategy_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--book-levels", type=int, choices=(1, 5, 10, 20), help="override backtest.book_levels")
     p.add_argument("--book-window-s", type=int, help="override backtest.book_window_s")
     p.add_argument("--max-spread-bps", type=float, help="override backtest.max_spread_bps")
+    p.add_argument("--min-edge", type=float, help="value: override backtest.min_edge")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -371,6 +427,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--duration", type=float, default=180.0, help="seconds")
     r = dsub.add_parser("record", help="record 1s order-book samples (+ candles) for order-book backtests")
     r.add_argument("--duration", type=float, default=None, help="seconds (default: until Ctrl+C)")
+    cal = dsub.add_parser("calibrate", help="measure win rates per |z| bucket for the value strategy")
+    cal.add_argument("--start", required=True, help="UTC; use a period BEFORE the one you backtest")
+    cal.add_argument("--end", required=True)
+    cal.add_argument("--decision-s", type=int, nargs="+", default=[60, 270])
     ro = dsub.add_parser("record-odds", help="record Predict.fun odds of the current Up/Down round (needs no key on testnet)")
     ro.add_argument("--duration", type=float, default=None, help="seconds (default: until Ctrl+C)")
     dsub.add_parser("clock", help="compare local clock with Binance server time")
@@ -394,6 +454,8 @@ def main(argv: list[str] | None = None) -> int:
                     return asyncio.run(cmd_data_record(cfg, args.duration))
                 except KeyboardInterrupt:
                     return 0
+            case "calibrate":
+                return asyncio.run(cmd_data_calibrate(cfg, args.start, args.end, args.decision_s))
             case "record-odds":
                 from bot.data.odds_recorder import record_odds
 

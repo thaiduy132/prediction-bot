@@ -92,7 +92,7 @@ class DataConfig(_Strict):
 
 
 class BacktestConfig(_Strict):
-    strategy: str = "momentum"  # momentum | reversal | always_up | book | momentum_book
+    strategy: str = "momentum"  # momentum | reversal | always_up | book | momentum_book | value
     decision_s: int = Field(270, gt=0)  # seconds after round open when the bet is placed
     min_move_bps: float = Field(1.0, ge=0)  # momentum/reversal: skip if |move| is smaller
     # Net profit per unit stake on a win; a loss costs 1. MUST match the market's real
@@ -104,6 +104,10 @@ class BacktestConfig(_Strict):
     use_odds: bool = False
     fee_bps: float = Field(0.0, ge=0)
     max_entry_price: float = Field(1.0, gt=0, le=1)  # skip bets that cost more than this per share
+    # value strategy: bet only when calibrated win probability beats the price by min_edge
+    calibration_path: Path = Path("data/calibration.json")  # built by `python -m bot data calibrate`
+    min_edge: float = Field(0.03, ge=0)  # required expected profit per unit staked, after fee
+    min_samples: int = Field(100, ge=1)  # ignore |z| buckets measured on fewer rounds
     # order-book strategies (need recorded data, see `python -m bot data record`)
     book_levels: int = Field(10, description="1 | 5 | 10 | 20 levels used for imbalance")
     book_window_s: int = Field(10, gt=0)  # average imbalance over the last N seconds

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
+from bot.backtest.calibration import SIGMA_WINDOW_S
 from bot.backtest.pricing import bet_pnl, entry_price
 from bot.backtest.strategy import RoundContext, Side, Strategy
 from bot.data.book_store import BookSample
@@ -60,6 +61,7 @@ def decide_entry(
     book: Sequence[BookSample],
     odds: Sequence[OddsSample] | None,
     max_entry_price: float = 1.0,
+    lookback: Sequence[Kline] = (),
 ) -> tuple[Entry | None, str | None]:
     """The single place that decides whether and what to bet, shared by backtest and paper trading.
 
@@ -73,16 +75,20 @@ def decide_entry(
     if getattr(strategy, "needs_book", False) and (not book or book[-1].ts < decision_time - BOOK_MAX_STALE_MS):
         return None, "no_book"
 
-    ctx = RoundContext(round_open_time, round_open, decision_time, recent, book)
+    # Odds mode: use the quote that was known at decision time, never a later one.
+    known = [] if odds is None else [q for q in odds if decision_time - ODDS_MAX_STALE_MS <= q.ts <= decision_time]
+    quote = known[-1] if known else None
+    if getattr(strategy, "needs_odds", False) and quote is None:
+        return None, "no_odds"
+
+    ctx = RoundContext(round_open_time, round_open, decision_time, recent, book, lookback, quote)
     side = strategy.decide(ctx)
     if side is None:
         return None, "by_strategy"
     if odds is None:
         return Entry(side, None, ctx.move_bps), None
 
-    # Odds mode: pay the quote that was known at decision time, never a later one.
-    known = [q for q in odds if decision_time - ODDS_MAX_STALE_MS <= q.ts <= decision_time]
-    price = entry_price(side, known[-1]) if known else None
+    price = entry_price(side, quote) if quote is not None else None
     if price is None or not 0 < price < 1:
         return None, "no_odds"
     if price > max_entry_price:
@@ -126,9 +132,11 @@ def run_backtest(
         # A book sample for second ts is only knowable at ts + 1000, hence ts < decision_time.
         book = [book_by_ts[t] for t in range(decision_time - BOOK_LOOKBACK_S * 1000, decision_time, 1000)
                 if t in book_by_ts]
+        lookback = [by_open[t] for t in range(decision_time - SIGMA_WINDOW_S * 1000, decision_time, 1000)
+                    if t in by_open]
         entry, skip = decide_entry(
             strategy, r.open_time, r.open, decision_time, recent, book,
-            None if odds_samples is None else odds_by_round.get(r.open_time, ()), max_entry_price)
+            None if odds_samples is None else odds_by_round.get(r.open_time, ()), max_entry_price, lookback)
         if entry is None:
             setattr(res, f"rounds_skipped_{skip}", getattr(res, f"rounds_skipped_{skip}") + 1)
             continue

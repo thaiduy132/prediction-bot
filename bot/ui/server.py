@@ -123,6 +123,8 @@ class Dashboard:
                 continue
             for k in ks:
                 self._put(interval, _candle(k))
+            if self.paper is not None and interval == "1s":
+                self.paper.seed_seconds(ks)
             log_event(log, "ui.history_loaded", interval=interval, candles=len(ks))
 
     async def _pump(self, feed: LiveFeed) -> None:

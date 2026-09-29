@@ -44,7 +44,7 @@ data:
   book_path: data/book.sqlite   # mẫu order book 1 giây/lần, ghi bằng `data record` hoặc `ui`
 
 backtest:
-  strategy: momentum        # momentum | reversal | always_up | book | momentum_book
+  strategy: momentum        # momentum | reversal | always_up | book | momentum_book | value
   decision_s: 270           # đặt lệnh sau khi vòng mở 270s (còn 30s)
   min_move_bps: 1.0         # momentum/reversal: bỏ qua nếu |biến động| nhỏ hơn
   # !!! PHẢI ĐỐI CHIẾU tỷ lệ thắng thực của thị trường (lãi ròng trên 1 đơn vị cược khi thắng).
@@ -55,6 +55,10 @@ backtest:
   use_odds: false
   fee_bps: 0                # phí Binance tính trên tiền cược mỗi lệnh; điền phí thật, 0 sẽ làm kết quả đẹp hơn thực tế
   max_entry_price: 1.0      # bỏ qua lệnh có giá mua/cổ phiếu cao hơn mức này (vd 0.9)
+  # chiến lược value: chỉ vào lệnh khi xác suất thắng đã hiệu chỉnh cao hơn giá mua đủ nhiều
+  calibration_path: data/calibration.json   # tạo bằng `python -m bot data calibrate`
+  min_edge: 0.03            # lãi kỳ vọng tối thiểu trên 1 đơn vị cược, sau phí
+  min_samples: 100          # bỏ qua nhóm |z| có ít hơn N vòng khi hiệu chỉnh
   # chiến lược order book (cần dữ liệu đã ghi bằng `python -m bot data record`)
   book_levels: 10           # 1 | 5 | 10 | 20 mức giá dùng tính imbalance
   book_window_s: 10         # lấy trung bình imbalance trong N giây cuối
