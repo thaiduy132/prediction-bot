@@ -77,6 +77,23 @@ predict:
 paper:
   trades_path: data/paper.sqlite   # lệnh giả lập (paper), giữ lại giữa các lần chạy
 
+live:
+  # Lệnh thật đi qua Binance Agentic Wallet CLI: npm install -g @binance/agentic-wallet && baw auth signin
+  # Chạy `run --mode shadow` trước (báo giá thật, KHÔNG đặt lệnh); live cần thêm --i-understand-the-risk.
+  baw_path: baw
+  chain_id: 56                  # BNB Smart Chain (Predict.fun)
+  stake_usd: 1.0                # tiền cược mỗi lệnh
+  max_daily_loss_usd: 3.0       # lỗ tối đa/ngày (tính cả lệnh đang mở như đã thua)
+  max_bets_per_day: 20
+  max_open_positions: 1
+  slippage_bps: 200
+  max_price_slippage: 0.02      # bỏ lệnh nếu giá báo thật tệ hơn giá lúc quyết định quá mức này
+  deadline_ms: 5000             # bỏ lệnh nếu không gửi được trong 5s sau quyết định
+  max_retries: 3                # Binance báo FAILED thì đặt lại (báo giá mới), tối đa 3 lần
+  retry_window_s: 60            # không đặt lại nếu đã quá 60s sau lúc quyết định
+  kill_switch_path: data/STOP   # tạo file này để dừng đặt lệnh ngay lập tức
+  journal_path: data/live.sqlite
+
 logging:
   level: INFO
   file: data/bot.log.jsonl

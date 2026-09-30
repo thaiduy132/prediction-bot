@@ -95,6 +95,17 @@ def test_gap_in_last_second_is_no_data_not_a_bet():
     assert not tr.open and tr.last_decision["result"] == "skip: no_data"
 
 
+def test_started_after_the_decision_second_skips_instead_of_deciding_late():
+    tr = trader(AlwaysUp())
+    tr.seed_seconds([k1s(T0 + i * 1000, 100.5) for i in range(270)])  # history incl. the decision second
+    tr.on_kline(k5m(False, 100.0, 100.0))
+    tr.on_odds(quote(T0 + 272_000, 0.79, 0.80))
+    tr.on_kline(k1s(T0 + 273_000, 100.5))  # first live candle is already past second 269
+    assert not tr.open and tr.last_decision["result"] == "skip: no_data"
+    tr.on_kline(k1s(T0 + 274_000, 100.5))
+    assert tr.counts == {"skipped_no_data": 1}  # decided (skipped) once, not again
+
+
 def test_decides_once_per_round():
     tr = trader(AlwaysUp())
     feed_round(tr)

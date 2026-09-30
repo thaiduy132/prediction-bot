@@ -73,6 +73,10 @@ class PaperTrader:
         self._decided: set[int] = set()
         self._seen_rounds: set[int] = set()
         self.counts: Counter[str] = Counter()
+        # Optional hooks for the shadow/live executor (bot.live.executor): called when a bet is taken
+        # and when the round it was taken in settles. They must return quickly.
+        self.on_entry: Callable[[OpenBet], None] | None = None
+        self.on_settle: Callable[[int, Outcome], None] | None = None
         self.reload()
 
     def reload(self) -> None:
@@ -126,6 +130,11 @@ class PaperTrader:
         if round_open in self._decided or k.open_time < decision_time - 1000:
             return False
         self._decided.add(round_open)
+        if k.open_time > decision_time - 1000:
+            # The decision second's candle never arrived live (we started mid-round or it was lost):
+            # deciding now would use a later moment than the backtest does, so skip the round.
+            self._record_skip(round_open, "no_data")
+            return True
 
         recent = [self._seconds[t] for t in range(round_open, decision_time, 1000) if t in self._seconds]
         book = [b for b in self._book if b.ts < decision_time]  # a sample is knowable from ts + 1000
@@ -143,7 +152,10 @@ class PaperTrader:
         if entry is None:
             self._record_skip(round_open, skip or "unknown")
             return True
-        self.open[round_open] = OpenBet(round_open, entry.side, entry.price, entry.move_bps, self._clock())
+        bet = OpenBet(round_open, entry.side, entry.price, entry.move_bps, self._clock())
+        self.open[round_open] = bet
+        if self.on_entry is not None:
+            self.on_entry(bet)
         self.last_decision = {"round_open": round_open, "result": "bet", "side": entry.side.value,
                               "price": entry.price, "at": self._clock()}
         return True
@@ -162,6 +174,10 @@ class PaperTrader:
         self._seen_rounds.add(k.open_time)
         self.result.rounds_total += 1
         self.result.outcomes[outcome.value] = self.result.outcomes.get(outcome.value, 0) + 1
+        if self.on_settle is not None:
+            # every closed round, not only rounds with a paper bet: real orders placed before a
+            # restart must still be settled
+            self.on_settle(k.open_time, outcome)
         bet = self.open.pop(k.open_time, None)
         if bet is None:
             return False

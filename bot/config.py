@@ -126,6 +126,23 @@ class PredictConfig(_Strict):
     odds_path: Path = Path("data/odds.sqlite")
 
 
+class LiveConfig(_Strict):
+    # Real orders go through the Binance Agentic Wallet CLI; sign in first with `baw auth signin`.
+    baw_path: str = "baw"
+    chain_id: int = 56  # BNB Smart Chain, where Predict.fun markets live
+    stake_usd: float = Field(1.0, gt=0)  # per bet
+    max_daily_loss_usd: float = Field(3.0, gt=0)  # worst case, open bets counted as lost
+    max_bets_per_day: int = Field(20, ge=1)
+    max_open_positions: int = Field(1, ge=1)
+    slippage_bps: int = Field(200, ge=0, le=5000)
+    max_price_slippage: float = Field(0.02, ge=0, le=1)  # quote vs decision price, per share
+    deadline_ms: int = Field(5_000, gt=0)  # give up if not sent this long after the decision
+    max_retries: int = Field(3, ge=0)  # re-send (fresh quote) when Binance marks an order FAILED
+    retry_window_s: int = Field(60, gt=0)  # no retry later than this after the decision
+    kill_switch_path: Path = Path("data/STOP")  # create this file to stop new orders immediately
+    journal_path: Path = Path("data/live.sqlite")
+
+
 class PaperConfig(_Strict):
     trades_path: Path = Path("data/paper.sqlite")  # simulated bets, kept across restarts
 
@@ -144,6 +161,7 @@ class AppConfig(_Strict):
     backtest: BacktestConfig = BacktestConfig()
     predict: PredictConfig = PredictConfig()
     paper: PaperConfig = PaperConfig()
+    live: LiveConfig = LiveConfig()
     logging: LoggingConfig = LoggingConfig()
 
 

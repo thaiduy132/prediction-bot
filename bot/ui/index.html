@@ -63,6 +63,17 @@
   th { position: sticky; top: 0; background: var(--panel); color: var(--dim); font-weight: 600; font-size: 12px; }
   th:first-child, td:first-child { text-align: left; }
   .muted { color: var(--dim); }
+  .livesec { padding: 16px 20px 0; }
+  .livesec[hidden] { display: none; }
+  .livesec .panel { border-color: var(--warn); }
+  .livehead { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 12px; }
+  .livehead h2 { margin: 0; color: var(--warn); }
+  .livehead .spacer { flex: 1; }
+  .btn { border: 1px solid var(--line); background: var(--bg); color: var(--text); border-radius: 6px; padding: 6px 14px; cursor: pointer; font-weight: 600; }
+  .btn.stop { border-color: var(--down); color: var(--down); }
+  .btn.go { border-color: var(--up); color: var(--up); }
+  .pill { padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; background: var(--line); }
+  .pill.ok { color: var(--up); } .pill.bad { color: var(--down); }
 </style>
 </head>
 <body>
@@ -74,6 +85,30 @@
   <span class="kv">Spread <b id="spread">—</b></span>
   <span class="status"><i class="dot" id="dot"></i><span id="statusText">connecting…</span></span>
 </header>
+<section class="livesec" id="liveSec" hidden>
+  <div class="panel">
+    <div class="livehead">
+      <h2 id="lvTitle">Live · real money</h2>
+      <span class="pill" id="lvState">—</span>
+      <span class="kv" id="lvLimits"></span>
+      <span class="spacer"></span>
+      <button class="btn stop" id="lvStop">Stop new orders</button>
+    </div>
+    <div class="tiles">
+      <div class="tile"><span>Wallet USDT (BSC)</span><b id="lvBal">—</b><small id="lvBalAge">&nbsp;</small></div>
+      <div class="tile"><span>Change since bot start</span><b id="lvChg">—</b><small>real balance, fees included</small></div>
+      <div class="tile"><span>Real orders today</span><b id="lvBets">0</b><small id="lvWL">&nbsp;</small></div>
+      <div class="tile"><span>Real PnL today (Binance)</span><b id="lvReal">—</b><small id="lvEst">&nbsp;</small></div>
+      <div class="tile"><span>Positions</span><b id="lvPos">—</b><small id="lvClaim">&nbsp;</small></div>
+    </div>
+    <div class="row">Open order <b id="lvOpen">—</b></div>
+    <div class="row">Last action <b id="lvLast">—</b></div>
+    <div class="tablewrap" style="max-height:260px;margin-top:10px">
+      <table><thead><tr><th>Round</th><th>Side</th><th>Stake $</th><th>Decided</th><th>Price</th><th>Fee (sh)</th><th>Status</th><th>PnL $</th><th>Order</th></tr></thead>
+      <tbody id="lvRows"><tr><td colspan="9" class="muted">No real orders yet</td></tr></tbody></table>
+    </div>
+  </div>
+</section>
 <main>
   <section class="panel">
     <div class="tabs" id="tabs"></div>
@@ -109,7 +144,7 @@
 <section class="paper" id="paperSec" hidden>
   <div class="panel">
     <div class="phead">
-      <h2>Paper trading <span class="tag">simulated · no real orders</span></h2>
+      <h2>Simulation (paper) <span class="tag">what the strategy would do · no money</span></h2>
       <span class="kv" id="pMeta"></span>
     </div>
     <div class="tiles">
@@ -130,6 +165,16 @@
       <div>
         <h2>Cumulative PnL</h2>
         <svg id="pCurve" viewBox="0 0 600 140" preserveAspectRatio="none"></svg>
+      </div>
+    </div>
+    <div id="liveBox" hidden>
+      <h2>Real orders <span class="tag" id="liveMode"></span></h2>
+      <div class="row">Today <b id="liveToday">—</b></div>
+      <div class="row">Status <b id="liveBlocked">—</b></div>
+      <div class="row">Last action <b id="liveLast">—</b></div>
+      <div class="tablewrap" style="max-height:200px;margin-bottom:14px">
+        <table><thead><tr><th>Round</th><th>Mode</th><th>Side</th><th>Decided</th><th>Quote</th><th>Fee</th><th>Status</th><th>PnL $</th></tr></thead>
+        <tbody id="liveRows"></tbody></table>
       </div>
     </div>
     <h2>Trades</h2>
@@ -244,12 +289,65 @@ function renderPaper() {
   const d = p.last_decision;
   $('pLast').textContent = d ? `${hhmm(d.round_open)} → ${d.result}` : '—';
 
+  const L = p.live;
+  renderLive(L);
+  $('liveBox').hidden = true;  // replaced by the Live section at the top
+  if (L) {
+    $('liveMode').textContent = L.mode === 'live' ? 'LIVE · real money' : 'shadow · real quotes, no orders';
+    $('liveToday').textContent = `${L.today.bets} bets · realized ${sgn(L.today.realized_pnl_usd, 2)}$ · open ${L.today.open}` +
+      ` · limits ${L.stake_usd}$/bet, -${L.limits.max_daily_loss_usd}$/day, ${L.limits.max_bets_per_day} bets/day`;
+    $('liveBlocked').textContent = L.blocked ? 'BLOCKED: ' + L.blocked : 'ready';
+    $('liveBlocked').className = L.blocked ? 'down' : 'up';
+    const a = L.last_action;
+    $('liveLast').textContent = a ? `${hhmm(a.round_open)} ${a.result}: ${a.detail}` : '—';
+    const f = v => v == null ? '—' : fmt(v, 3);
+    $('liveRows').innerHTML = L.recent.map(r => `<tr><td>${hhmm(r.round_open)}</td><td>${r.mode}</td><td class="${r.side.toLowerCase()}">${r.side}</td>` +
+      `<td>${f(r.decided_price)}</td><td>${f(r.quote_price)}</td><td>${f(r.quote_fee)}</td><td title="${r.reason || ''}">${r.status}</td>` +
+      `<td class="${cls(r.pnl_usd || 0)}">${r.pnl_usd == null ? '—' : sgn(r.pnl_usd, 2)}</td></tr>`).join('');
+  }
   renderCurve(p.curve);
   $('pRows').innerHTML = p.trades.length ? p.trades.slice().reverse().map(t =>
     `<tr><td>${hhmm(t.round_open)}</td><td class="${t.side.toLowerCase()}">${t.side}</td>` +
     `<td>${t.entry_price == null ? '—' : fmt(t.entry_price, 2)}</td><td class="${t.outcome === t.side ? 'up' : t.outcome === 'VOID' ? 'void' : 'down'}">${t.outcome === t.side ? 'WIN' : t.outcome === 'VOID' ? 'VOID' : 'LOSS'}</td>` +
     `<td class="${cls(t.pnl)}">${sgn(t.pnl)}</td><td class="${cls(t.cum_pnl)}">${sgn(t.cum_pnl)}</td></tr>`).join('')
     : '<tr><td colspan="6" class="muted">No trades yet</td></tr>';
+}
+
+let wsConn = null;
+function renderLive(L) {
+  $('liveSec').hidden = !L;
+  if (!L) return;
+  const live = L.mode === 'live', a = L.account || {}, now = Date.now();
+  $('lvTitle').textContent = live ? 'Live · real money' : 'Shadow · real quotes, no orders';
+  const st = L.stopped ? ['STOPPED', 'bad'] : L.blocked ? ['BLOCKED: ' + L.blocked, 'bad'] : [live ? 'TRADING' : 'SHADOW', 'ok'];
+  $('lvState').textContent = st[0]; $('lvState').className = 'pill ' + st[1];
+  $('lvLimits').textContent = `${L.stake_usd}$/bet · max loss ${L.limits.max_daily_loss_usd}$/day · max ${L.limits.max_bets_per_day} bets/day`;
+  $('lvStop').textContent = L.stopped ? 'Resume orders' : 'Stop new orders';
+  $('lvStop').className = 'btn ' + (L.stopped ? 'go' : 'stop');
+  $('lvBal').textContent = a.usdt == null ? '—' : fmt(a.usdt, 2) + ' $';
+  $('lvBalAge').textContent = a.error ? 'error: ' + a.error.slice(0, 60) : a.updated_at ? 'updated ' + Math.round((now - a.updated_at) / 1000) + 's ago' : 'loading…';
+  const chg = a.usdt != null && a.start_usdt != null ? a.usdt - a.start_usdt : null;
+  $('lvChg').textContent = chg == null ? '—' : sgn(chg, 2) + ' $'; $('lvChg').className = cls(chg || 0);
+  const rows = (L.recent || []).filter(r => r.mode === L.mode);
+  const done = rows.filter(r => ['won', 'lost', 'void'].includes(r.status));
+  $('lvBets').textContent = L.today.bets;
+  $('lvWL').textContent = done.length ? `${done.filter(r => r.status === 'won').length}W · ${done.filter(r => r.status === 'lost').length}L (recent)` : '';
+  const real = a.today_realized;
+  $('lvReal').textContent = real == null ? '—' : sgn(real, 2) + ' $'; $('lvReal').className = cls(real || 0);
+  $('lvEst').textContent = `bot's own books: ${sgn(L.today.realized_pnl_usd, 2)} $`;
+  $('lvPos').textContent = a.positions == null ? '—' : a.positions;
+  $('lvClaim').textContent = a.pending_claim ? a.pending_claim + ' win(s) waiting to be claimed' : '';
+  const open = rows.find(r => r.status === 'submitted' || r.status === 'filled');
+  $('lvOpen').textContent = open ? `${open.side} ${open.stake_usd}$ @ ~${fmt(open.quote_price, 3)} · settles in ${mmss((open.round_open + state.roundSec * 1000 - now) / 1000)}` : 'none';
+  const la = L.last_action;
+  $('lvLast').textContent = la ? `${hhmm(la.round_open)} ${la.result}: ${la.detail}` : '—';
+  const f = v => v == null ? '—' : fmt(v, 3);
+  const scls = s => s === 'won' ? 'up' : s === 'lost' || s === 'failed' ? 'down' : s === 'submitted' || s === 'filled' ? 'void' : 'muted';
+  $('lvRows').innerHTML = rows.length ? rows.map(r => `<tr><td>${hhmm(r.round_open)}</td><td class="${r.side.toLowerCase()}">${r.side}</td>` +
+    `<td>${fmt(r.stake_usd, 2)}</td><td>${f(r.decided_price)}</td><td>${f(r.quote_price)}</td><td>${f(r.quote_fee)}</td>` +
+    `<td class="${scls(r.status)}" title="${(r.reason || '').replace(/"/g, "'")}">${r.status}${r.reason ? ' ⓘ' : ''}</td>` +
+    `<td class="${cls(r.pnl_usd || 0)}" title="${r.pnl_source || ''}">${r.pnl_usd == null ? '—' : sgn(r.pnl_usd, 2) + (r.pnl_source === 'binance' ? ' ✓' : ' ~')}</td><td class="muted">${r.order_id ? String(r.order_id).slice(-6) : ''}</td></tr>`).join('')
+    : '<tr><td colspan="9" class="muted">No real orders yet</td></tr>';
 }
 
 function renderDepth(imb) {
@@ -296,8 +394,10 @@ function upsert(iv, c) {
 
 function setStatus(ok, text) { $('dot').className = 'dot' + (ok ? ' ok' : ''); $('statusText').textContent = text; }
 
+function sendCmd(cmd) { if (wsConn && wsConn.readyState === 1) wsConn.send(JSON.stringify({ cmd })); }
+
 function connect() {
-  const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+  const ws = wsConn = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
   ws.onopen = () => setStatus(false, 'waiting for data…');
   ws.onclose = () => { setStatus(false, 'dashboard disconnected, retrying…'); setTimeout(connect, 2000); };
   ws.onmessage = ev => {
@@ -335,6 +435,10 @@ function connect() {
   };
 }
 
+$('lvStop').onclick = () => {
+  const stopped = $('lvStop').textContent.startsWith('Resume');
+  if (!stopped || confirm('Resume REAL-MONEY orders?')) sendCmd(stopped ? 'resume' : 'stop');
+};
 initChart();
 connect();
 setInterval(renderRound, 250);  // countdown ticks between messages

@@ -12,12 +12,13 @@ import json
 import logging
 from http import HTTPStatus
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from websockets.asyncio.server import ServerConnection, broadcast, serve
 from websockets.http11 import Request, Response
 
 from bot.backtest.features import imbalance
+from bot.clock_sync import describe_offset, keep_clock_synced, sync_clock
 from bot.config import AppConfig
 from bot.data.binance_rest import BinanceRestClient, BinanceRestError
 from bot.data.binance_ws import BinanceStream, BookTickerEvent, ConnectionEvent, DepthEvent, GapEvent, KlineEvent
@@ -31,6 +32,10 @@ from bot.logging_setup import log_event
 from bot.models import Kline
 from bot.paper.store import PaperStore
 from bot.paper.trader import PaperTrader
+from bot.settlement import settle_kline
+
+if TYPE_CHECKING:
+    from bot.live.executor import LiveExecutor
 from bot.timeutil import floor_to, interval_ms, now_ms
 
 log = logging.getLogger(__name__)
@@ -48,7 +53,8 @@ def _candle(k: Kline) -> dict[str, Any]:
 
 class Dashboard:
     def __init__(self, cfg: AppConfig, host: str, port: int, paper: PaperTrader | None = None,
-                 api_key: str | None = None) -> None:
+                 api_key: str | None = None, executor: LiveExecutor | None = None) -> None:
+        self.executor = executor  # shadow/live orders on top of the paper decisions
         self.cfg = cfg
         self.host, self.port = host, port
         self.paper = paper  # live paper trader (no real orders); None = price monitor only
@@ -84,7 +90,7 @@ class Dashboard:
             "server_ms": now_ms(),
             "book": self.book,
             "depth_imb": self.depth_imb,
-            "paper": None if self.paper is None else self.paper.snapshot(),
+            "paper": None if self.paper is None else self._paper_view(),
             "candles": {i: [d[t] for t in sorted(d)] for i, d in self.candles.items()},
         })
 
@@ -106,8 +112,19 @@ class Dashboard:
 
     async def _handler(self, ws: ServerConnection) -> None:
         await ws.send(self.snapshot())
-        async for _ in ws:  # client sends nothing; just keep the socket open
-            pass
+        async for raw in ws:  # the only messages accepted: STOP / RESUME of real orders
+            try:
+                cmd = json.loads(raw).get("cmd")
+            except (ValueError, AttributeError):
+                continue
+            # Browsers let ANY website open a WebSocket to 127.0.0.1, so only this page may send commands.
+            origin = ws.request.headers.get("Origin") if ws.request is not None else None
+            if origin not in {f"http://{h}:{self.port}" for h in (self.host, "127.0.0.1", "localhost")}:
+                log_event(log, "ui.command_rejected", logging.WARNING, origin=origin, cmd=cmd)
+                continue
+            if self.executor is not None and cmd in ("stop", "resume"):
+                self.executor.set_stopped(cmd == "stop")
+                self._push_paper()
 
     # ---- data -------------------------------------------------------------------
 
@@ -125,6 +142,11 @@ class Dashboard:
                 self._put(interval, _candle(k))
             if self.paper is not None and interval == "1s":
                 self.paper.seed_seconds(ks)
+            if self.executor is not None and interval == self.cfg.market.round_interval:
+                # real orders from before a restart whose round has closed since: book them now
+                for k in ks:
+                    if k.is_closed:
+                        self.executor.on_settle(k.open_time, settle_kline(k, self.cfg.settlement.rule, interval))
             log_event(log, "ui.history_loaded", interval=interval, candles=len(ks))
 
     async def _pump(self, feed: LiveFeed) -> None:
@@ -156,9 +178,15 @@ class Dashboard:
                 case GapEvent():
                     self._push({"t": "gap", "interval": ev.interval, "filled": ev.filled, "expected": ev.expected})
 
+    def _paper_view(self) -> dict[str, Any]:
+        assert self.paper is not None
+        view = self.paper.snapshot()
+        view["live"] = None if self.executor is None else self.executor.status()
+        return view
+
     def _push_paper(self) -> None:
         if self.paper is not None:
-            self._push({"t": "paper", "paper": self.paper.snapshot()})
+            self._push({"t": "paper", "paper": self._paper_view()})
 
     async def _paper_ticker(self) -> None:
         """Refresh the paper panel every second (countdowns, current odds) even when nothing traded."""
@@ -184,12 +212,23 @@ class Dashboard:
             async with BinanceRestClient(self.cfg.rest.base_url, self.cfg.rest.timeout_s,
                                          self.cfg.rest.max_retries) as rest, \
                     PredictClient(self.cfg.predict.base_url, self.api_key, self.cfg.predict.timeout_s) as predict:
+                offset = await sync_clock(rest)  # before anything reads the time
+                print(describe_offset(offset), flush=True)
+                tasks.append(asyncio.create_task(keep_clock_synced(rest)))
                 await self._load_history(rest)
                 stream = BinanceStream(self.cfg.websocket, self.cfg.market.symbol)
                 feed = LiveFeed(stream, rest, self.cfg.websocket.kline_intervals, cache=cache)
                 if self.paper is not None and self.paper.use_odds:
                     poller = OddsPoller(self.cfg, predict)  # live only; `data record-odds` is what stores them
                     tasks.append(asyncio.create_task(poller.run(self._on_odds)))
+                    if self.executor is not None:
+                        self.executor.tokens = lambda r: poller.outcome_tokens(r)  # type: ignore[assignment,return-value]
+                        self.paper.on_entry = self.executor.on_entry
+                        self.paper.on_settle = self.executor.on_settle
+                        tasks.append(asyncio.create_task(self.executor.redeem_loop()))
+                        tasks.append(asyncio.create_task(self.executor.topic_loop()))
+                        tasks.append(asyncio.create_task(self.executor.account_loop()))
+                        tasks.append(asyncio.create_task(self.executor.reconcile_loop()))
                 if self.paper is not None:
                     tasks.append(asyncio.create_task(self._paper_ticker()))
                 async with serve(self._handler, self.host, self.port,
@@ -208,6 +247,6 @@ class Dashboard:
 
 
 async def cmd_ui(cfg: AppConfig, host: str, port: int, paper: PaperTrader | None = None,
-                 api_key: str | None = None) -> int:
-    await Dashboard(cfg, host, port, paper, api_key).run()
+                 api_key: str | None = None, executor: LiveExecutor | None = None) -> int:
+    await Dashboard(cfg, host, port, paper, api_key, executor).run()
     return 0

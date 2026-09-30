@@ -13,7 +13,9 @@ from collections import Counter
 from collections.abc import Callable
 from typing import Any
 
+from bot.clock_sync import describe_offset, keep_clock_synced, sync_clock
 from bot.config import AppConfig
+from bot.data.binance_rest import BinanceRestClient
 from bot.data.odds_store import OddsSample, OddsStore
 from bot.data.predict_client import PredictClient, PredictError, round_slug
 from bot.logging_setup import log_event
@@ -47,6 +49,19 @@ class OddsPoller:
         self._markets: dict[str, dict[str, Any]] = {}
         self._listed_at = 0
         self._resolved_at = 0
+
+    def outcome_tokens(self, round_start_ms: int) -> dict[str, str] | None:
+        """{"UP": onChainId, "DOWN": onChainId} of that round's market, if it is listed.
+
+        Predict.fun outcome tokens are the ERC1155 ids that `baw prediction trade quote --tokenId` takes
+        (checked 2026-09-30: identical to the tokenId Binance lists for the same round).
+        """
+        m = self._markets.get(round_slug(self.cfg.market.symbol, self.round_ms // 1000, round_start_ms // 1000))
+        if m is None:
+            return None
+        out = {str(o.get("name", "")).upper(): str(o["onChainId"]) for o in m.get("outcomes") or []
+               if o.get("onChainId")}
+        return out if {"UP", "DOWN"} <= out.keys() else None
 
     async def _refresh_list(self) -> None:
         self._markets = {m["categorySlug"]: m for m in await self.client.open_updown_markets()}
@@ -110,12 +125,18 @@ class OddsPoller:
 
 async def record_odds(cfg: AppConfig, api_key: str | None, duration_s: float | None) -> dict[str, Any]:
     store = OddsStore(cfg.predict.odds_path, cfg.market.symbol)
-    async with PredictClient(cfg.predict.base_url, api_key, cfg.predict.timeout_s) as client:
+    async with PredictClient(cfg.predict.base_url, api_key, cfg.predict.timeout_s) as client, \
+            BinanceRestClient(cfg.rest.base_url, cfg.rest.timeout_s, cfg.rest.max_retries) as rest:
+        # Quote timestamps and "which round is it" must be in Binance time, like the candles.
+        print(describe_offset(await sync_clock(rest)), flush=True)
+        resync = asyncio.create_task(keep_clock_synced(rest))
         poller = OddsPoller(cfg, client, store)
         try:
             await asyncio.wait_for(poller.run(), timeout=duration_s)
         except TimeoutError:
             pass
+        finally:
+            resync.cancel()
     out = {"host": cfg.predict.base_url, "counts": dict(poller.counts), "stored": store.summary()}
     store.close()
     return out

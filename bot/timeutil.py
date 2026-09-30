@@ -27,8 +27,29 @@ def ceil_to(ts_ms: int, step_ms: int) -> int:
     return ts_ms if r == 0 else ts_ms + (step_ms - r)
 
 
-def now_ms() -> int:
+# Binance server time minus this machine's clock, set by bot.clock_sync. The machine clock cannot be
+# trusted (seen 146s slow with NTP broken), while candles carry Binance time; mixing the two made
+# every odds quote look stale. Everything that asks "what time is it" goes through now_ms().
+_offset_ms = 0
+
+
+def local_ms() -> int:
+    """This machine's raw clock. Only for measuring the offset; use now_ms() everywhere else."""
     return time.time_ns() // 1_000_000
+
+
+def now_ms() -> int:
+    """Current time in epoch ms, aligned to Binance server time once the clock has been synced."""
+    return local_ms() + _offset_ms
+
+
+def set_clock_offset(offset_ms: int) -> None:
+    global _offset_ms
+    _offset_ms = int(offset_ms)
+
+
+def clock_offset_ms() -> int:
+    return _offset_ms
 
 
 def parse_utc(s: str) -> int:

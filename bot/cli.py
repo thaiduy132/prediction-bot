@@ -14,6 +14,7 @@ from bot.backtest.calibration import SIGMA_WINDOW_S, CalibrationTable, build_tab
 from bot.backtest.engine import run_backtest
 from bot.backtest.stats import summarize
 from bot.backtest.strategy import BookParams, Strategy, Value, ValueParams, make_strategy
+from bot.clock_sync import describe_offset, keep_clock_synced, sync_clock
 from bot.config import AppConfig, load_config
 from bot.data.binance_rest import BinanceRestClient
 from bot.data.binance_ws import BinanceStream, BookTickerEvent, ConnectionEvent, DepthEvent, GapEvent, KlineEvent
@@ -26,7 +27,7 @@ from bot.paper.trader import PaperTrader
 from bot.secrets import load_secrets
 from bot.settlement import cross_check_with_1m, settle_kline
 from bot.storage.db import connect
-from bot.timeutil import ceil_to, floor_to, interval_ms, ms_to_iso, now_ms, parse_utc
+from bot.timeutil import ceil_to, floor_to, interval_ms, local_ms, ms_to_iso, now_ms, parse_utc
 
 log = logging.getLogger("bot")
 
@@ -228,10 +229,55 @@ async def cmd_backtest(cfg: AppConfig, args: argparse.Namespace) -> int:
 
 # ---- dashboard / paper trading ------------------------------------------------------
 
-def _run_dashboard(cfg: AppConfig, args: argparse.Namespace, secrets: object, paper: bool) -> int:
+def _build_executor(cfg: AppConfig, args: argparse.Namespace, live: bool, strategy_name: str):  # noqa: ANN202
+    """Shadow or live executor, after pre-flight checks. Returns (executor, journal) or exits."""
+    from bot.live.baw import BawClient, BawError
+    from bot.live.executor import ExecConfig, LiveExecutor
+    from bot.live.journal import LiveJournal
+    from bot.live.risk import RiskLimits, RiskManager
+
+    lc = cfg.live
+    if live and not args.i_understand_the_risk:
+        raise SystemExit("live đặt lệnh bằng TIỀN THẬT. Chạy `--mode shadow` trước; khi chắc chắn thì thêm "
+                         "--i-understand-the-risk.")
+    if not (cfg.backtest.use_odds or args.odds):
+        raise SystemExit("shadow/live cần odds Predict.fun: đặt backtest.use_odds: true hoặc thêm --odds.")
+    baw = BawClient(lc.baw_path)
+    try:
+        status = asyncio.run(baw.wallet_status())
+    except BawError as e:
+        raise SystemExit(f"Không dùng được baw: {e}\nCài: npm install -g @binance/agentic-wallet, "
+                         "rồi đăng nhập: baw auth signin") from None
+    if str((status or {}).get("status", "")).upper() in ("UNCONNECTED", "NOT_LOGGED_IN", ""):
+        raise SystemExit(f"Ví chưa đăng nhập (baw wallet status: {status}). Chạy: baw auth signin")
+    limits = RiskLimits(lc.stake_usd, lc.max_daily_loss_usd, lc.max_bets_per_day, lc.max_open_positions,
+                        lc.kill_switch_path)
+    journal = LiveJournal(lc.journal_path)
+    from bot.data.predict_client import round_slug
+
+    round_ms = interval_ms(cfg.market.round_interval)
+    executor = LiveExecutor(
+        ExecConfig(live, lc.chain_id, lc.stake_usd, lc.slippage_bps, lc.max_price_slippage, lc.deadline_ms,
+                   max_retries=lc.max_retries, retry_window_ms=lc.retry_window_s * 1000),
+        baw, journal, RiskManager(limits, journal), tokens=lambda r: None,
+        slug_for=lambda r: round_slug(cfg.market.symbol, round_ms // 1000, r // 1000), round_ms=round_ms)
+    if live:
+        print(f"LIVE (TIỀN THẬT): {strategy_name}, {lc.stake_usd}$/lệnh, lỗ tối đa {lc.max_daily_loss_usd}$/ngày, "
+              f"tối đa {lc.max_bets_per_day} lệnh/ngày. Dừng khẩn cấp: tạo file {lc.kill_switch_path}", file=sys.stderr)
+        if strategy_name != "value":
+            print(f"CẢNH BÁO: chiến lược '{strategy_name}' chạy live. Chưa chiến lược nào được chứng minh có lợi thế.",
+                  file=sys.stderr)
+    else:
+        print("SHADOW: lấy báo giá thật từ Binance ở mỗi lần vào lệnh, KHÔNG đặt lệnh.", file=sys.stderr)
+    return executor, journal
+
+
+def _run_dashboard(cfg: AppConfig, args: argparse.Namespace, secrets: object, paper: bool,
+                   exec_mode: str | None = None) -> int:
     from bot.ui.server import cmd_ui
 
     trader = None
+    executor = journal = None
     if paper:
         p = _strategy_params(cfg, args)
         if p.strategy.needs_book and not cfg.websocket.depth_levels:
@@ -241,13 +287,18 @@ def _run_dashboard(cfg: AppConfig, args: argparse.Namespace, secrets: object, pa
                              p.max_entry_price, p.use_odds, p.payout)
         print(f"Paper trading: {p.name}, quyết định ở giây {p.decision_s}, "
               f"giá {'odds Predict.fun' if p.use_odds else f'payout cố định {p.payout}'}, phí {p.fee_bps} bps. "
-              "Không đặt lệnh thật.", file=sys.stderr)
+              "Không đặt lệnh thật." if exec_mode is None else "", file=sys.stderr)
+        if exec_mode is not None:
+            executor, journal = _build_executor(cfg, args, exec_mode == "live", p.name)
     key_secret = getattr(secrets, "predict_api_key", None)
     key = key_secret.get_secret_value() if key_secret else None
     try:
-        return asyncio.run(cmd_ui(cfg, args.host, args.port, trader, key))
+        return asyncio.run(cmd_ui(cfg, args.host, args.port, trader, key, executor))
     except KeyboardInterrupt:
         return 0
+    finally:
+        if journal is not None:
+            journal.close()
 
 
 # ---- calibration -----------------------------------------------------------------
@@ -288,6 +339,8 @@ async def cmd_data_stream(cfg: AppConfig, duration_s: float) -> int:
     cache = KlineCache(cfg.data.cache_path)
     counts: Counter[str] = Counter()
     async with _rest(cfg) as rest:
+        print(describe_offset(await sync_clock(rest)), file=sys.stderr, flush=True)
+        resync = asyncio.create_task(keep_clock_synced(rest))
         stream = BinanceStream(cfg.websocket, cfg.market.symbol)
         feed = LiveFeed(stream, rest, cfg.websocket.kline_intervals, cache=cache, status_conn=status_conn)
 
@@ -312,6 +365,8 @@ async def cmd_data_stream(cfg: AppConfig, duration_s: float) -> int:
             await asyncio.wait_for(consume(), timeout=duration_s)
         except TimeoutError:
             pass
+        finally:
+            resync.cancel()
     status_conn.close()
     cache.close()
     book = feed.last_book
@@ -331,6 +386,8 @@ async def cmd_data_record(cfg: AppConfig, duration_s: float | None) -> int:
     recorder = BookRecorder(store)
     counts: Counter[str] = Counter()
     async with _rest(cfg) as rest:
+        print(describe_offset(await sync_clock(rest)), file=sys.stderr, flush=True)
+        resync = asyncio.create_task(keep_clock_synced(rest))
         stream = BinanceStream(cfg.websocket, cfg.market.symbol)
         feed = LiveFeed(stream, rest, cfg.websocket.kline_intervals, cache=cache)
 
@@ -351,6 +408,7 @@ async def cmd_data_record(cfg: AppConfig, duration_s: float | None) -> int:
         except TimeoutError:
             pass
         finally:
+            resync.cancel()
             store.flush()
     cov = store.coverage()
     store.close()
@@ -363,9 +421,9 @@ async def cmd_data_record(cfg: AppConfig, duration_s: float | None) -> int:
 
 async def cmd_data_clock(cfg: AppConfig) -> int:
     async with _rest(cfg) as rest:
-        t0 = now_ms()
+        t0 = local_ms()  # raw machine clock: this command reports how wrong it is
         server = await rest.server_time()
-        t1 = now_ms()
+        t1 = local_ms()
     skew = server - (t0 + t1) // 2
     print(json.dumps({"server_time": ms_to_iso(server), "local_minus_server_ms": -skew, "rtt_ms": t1 - t0}, indent=2))
     if abs(skew) > 1000:
@@ -471,6 +529,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_dashboard(cfg, args, secrets, paper=args.paper)
     if args.command == "run" and args.mode == "paper":
         return _run_dashboard(cfg, args, secrets, paper=True)
+    if args.command == "run" and args.mode in ("shadow", "live"):
+        return _run_dashboard(cfg, args, secrets, paper=True, exec_mode=args.mode)
     if args.command == "run" and args.mode == "backtest":
         return asyncio.run(cmd_backtest(cfg, args))
     if args.command == "run":
