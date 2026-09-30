@@ -23,8 +23,9 @@ CREATE TABLE IF NOT EXISTS live_orders (
     stake_usd REAL NOT NULL, decided_price REAL,
     quote_id TEXT, quote_price REAL, quote_fee REAL, quote_json TEXT,
     order_id TEXT, order_json TEXT,
-    status TEXT NOT NULL,  -- skipped | quoted | submitted | filled | failed | won | lost | void
+    status TEXT NOT NULL,  -- skipped | quoted | submitted | filled | failed | won | lost | void | sold
     reason TEXT, pnl_usd REAL, pnl_source TEXT,  -- pnl_source: estimate | binance
+    sold_shares REAL, sold_usd REAL,  -- shares sold back before the round ended, and what they brought
     created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS live_orders_round ON live_orders(round_open);
@@ -50,9 +51,10 @@ class LiveJournal:
         self.conn: sqlite3.Connection = connect(path)
         self.conn.executescript(_SCHEMA)
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(live_orders)")}
-        if "pnl_source" not in cols:  # journals created before this column existed
-            self.conn.execute("ALTER TABLE live_orders ADD COLUMN pnl_source TEXT")
-            self.conn.commit()
+        for col, typ in (("pnl_source", "TEXT"), ("sold_shares", "REAL"), ("sold_usd", "REAL")):
+            if col not in cols:  # journals created before this column existed
+                self.conn.execute(f"ALTER TABLE live_orders ADD COLUMN {col} {typ}")
+        self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()
@@ -76,6 +78,10 @@ class LiveJournal:
         self.conn.execute(f"UPDATE live_orders SET {cols} WHERE id=?", (*fields.values(), row_id))
         self.conn.commit()
 
+    def latest_filled(self) -> dict[str, Any] | None:
+        rows = self._rows("SELECT * FROM live_orders WHERE mode='live' AND status='filled' ORDER BY id DESC LIMIT 1", ())
+        return rows[0] if rows else None
+
     def filled_for_round(self, round_open: int) -> list[dict[str, Any]]:
         return self._rows("SELECT * FROM live_orders WHERE round_open=? AND status='filled'", (round_open,))
 
@@ -88,7 +94,7 @@ class LiveJournal:
     def day_stats(self, day_start_ms: int) -> DayStats:
         bets, pnl = self.conn.execute(
             "SELECT COUNT(*), COALESCE(SUM(pnl_usd), 0) FROM live_orders WHERE mode='live' AND created_at>=? "
-            "AND status IN ('submitted','filled','won','lost','void')", (day_start_ms,)).fetchone()
+            "AND status IN ('submitted','filled','won','lost','void','sold')", (day_start_ms,)).fetchone()
         n_open, stake_open = self.conn.execute(
             "SELECT COUNT(*), COALESCE(SUM(stake_usd), 0) FROM live_orders WHERE mode='live' "
             "AND status IN ('submitted','filled')").fetchone()
@@ -96,7 +102,7 @@ class LiveJournal:
 
     def recent(self, limit: int = 20) -> list[dict[str, Any]]:
         return self._rows("SELECT id, round_open, mode, side, stake_usd, decided_price, quote_price, quote_fee, "
-                          "order_id, status, reason, pnl_usd, pnl_source, created_at FROM live_orders ORDER BY id DESC LIMIT ?",
+                          "order_id, status, reason, pnl_usd, pnl_source, sold_shares, sold_usd, created_at FROM live_orders ORDER BY id DESC LIMIT ?",
                           (limit,))
 
     def row(self, row_id: int) -> dict[str, Any]:

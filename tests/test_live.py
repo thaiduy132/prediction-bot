@@ -427,3 +427,115 @@ async def test_filled_first_time_means_no_retry(tmp_path):
     ex, fake, j = make(tmp_path, replies={"prediction order history": hist_seq("FILLED")})
     await ex.execute(bet())
     assert len(fake.called("prediction trade place-order")) == 1 and rows(j)[0]["status"] == "filled"
+
+
+# ---- selling the open position from the dashboard ---------------------------------------------
+
+from bot.data.odds_store import OddsSample  # noqa: E402
+
+
+def ongoing(shares: float, avg: float, token: str = "111") -> dict:
+    return {"success": True, "data": {"summary": {}, "counts": {"ongoingCount": 1},
+                                      "positions": [{"tokenId": token, "shares": shares, "avgPrice": avg}]}}
+
+
+SELL_QUOTE = {"success": True, "data": {"quoteId": "s-1", "side": "SELL", "amountIn": "1.8", "amountOut": "1.23",
+                                         "averagePrice": 0.69, "feeAmount": "0.012"}}
+
+
+async def filled_position(tmp_path, extra=None):
+    replies = {"prediction order history": history("FILLED"), "prediction position list": ongoing(1.8, 0.55)}
+    replies.update(extra or {})
+    ex, fake, j = make(tmp_path, replies=replies)
+    await ex.execute(bet(Side.UP, 0.55))
+    await ex.refresh_position()
+    return ex, fake, j
+
+
+async def test_position_is_valued_at_the_current_bid(tmp_path):
+    ex, _, _ = await filled_position(tmp_path)
+    v = ex.position_view(OddsSample(T0, NOW + 30_000, 1, 0.69, 0.71, 10, 10, 50, 50))
+    assert v["source"] == "binance" and v["shares"] == 1.8 and v["sell_price"] == 0.69
+    fee = 0.02 * 0.31 * 1.8
+    assert v["value_now"] == pytest.approx(1.8 * 0.69 - fee, abs=1e-4)
+    assert v["pnl_if_sold"] == pytest.approx(1.8 * 0.69 - fee - 1.8 * 0.55, abs=1e-4)
+    down = OddsSample(T0, NOW, 1, 0.69, 0.71, 10, 10, 50, 50)
+    ex.position["side"] = "DOWN"
+    assert ex.position_view(down)["sell_price"] == pytest.approx(0.29)  # selling DOWN hits 1 - Up ask
+    assert ex.position_view(OddsSample(T0 + 300_000, NOW, 1, 0.5, 0.51, 1, 1, 1, 1))["sell_price"] is None
+
+
+async def test_sell_quote_then_confirm_closes_the_position(tmp_path):
+    ex, fake, j = await filled_position(tmp_path, {
+        "prediction trade quote": [QUOTE_OK, SELL_QUOTE],
+        "prediction trade place-order": [ORDER_OK, {"success": True, "data": {"orderId": "sell-1"}}],
+        "prediction order history": [history("FILLED")["data"] and history("FILLED"),
+                                     {"success": True, "data": {"orders": [
+                                         {"orderId": "sell-1", "status": "FILLED", "filledShareQty": 1.8,
+                                          "filledUsdtAmount": 1.22}]}}]})
+    q = await ex.sell_quote(1.0)
+    sell_argv = fake.called("prediction trade quote")[-1]
+    assert sell_argv[sell_argv.index("--side") + 1] == "SELL" and sell_argv[sell_argv.index("--amount") + 1] == "1.8"
+    assert q["quote_id"] == "s-1" and q["proceeds"] == 1.23 and q["pnl_realized"] == pytest.approx(1.23 - 0.99)
+    assert len(fake.called("prediction trade place-order")) == 1  # quoting sold nothing
+    res = await ex.sell_confirm("s-1")
+    assert res["ok"] and res["closed"] and res["usd"] == 1.22
+    r = j.row(rows(j)[0]["id"])
+    assert r["status"] == "sold" and r["sold_shares"] == 1.8 and r["pnl_usd"] == pytest.approx(1.22 - 0.55 * 1.8)
+    ex.on_settle(T0, Outcome.DOWN)  # the round ending later must not re-book a sold position
+    assert j.row(r["id"])["status"] == "sold"
+
+
+async def test_partial_sell_then_round_settles_with_both_parts(tmp_path):
+    ex, _, j = await filled_position(tmp_path, {
+        "prediction trade quote": [QUOTE_OK, {"success": True, "data": {"quoteId": "s-2", "amountIn": "0.9",
+                                                                        "amountOut": "0.62", "averagePrice": 0.69}}],
+        "prediction trade place-order": [ORDER_OK, {"success": True, "data": {"orderId": "sell-2"}}],
+        "prediction order history": [history("FILLED"), {"success": True, "data": {"orders": [
+            {"orderId": "sell-2", "status": "FILLED", "filledShareQty": 0.9, "filledUsdtAmount": 0.62}]}}]})
+    q = await ex.sell_quote(0.5)
+    assert q["shares"] == 0.9
+    res = await ex.sell_confirm("s-2")
+    assert res["ok"] and not res["closed"]
+    row = j.row(rows(j)[0]["id"])
+    assert row["status"] == "filled" and row["sold_usd"] == 0.62
+    ex.on_settle(T0, Outcome.UP)
+    row = j.row(row["id"])
+    remaining = 1.0 / 0.55 - 0.04 - 0.9  # estimate from the buy quote, until Binance reconciles it
+    assert row["status"] == "won" and row["pnl_usd"] == pytest.approx(0.62 + remaining - 1.0, abs=1e-6)
+
+
+async def test_expired_or_unknown_quote_is_not_sold(tmp_path):
+    t = {"now": NOW + 500}
+    ex, fake, _ = await filled_position(tmp_path, {"prediction trade quote": [QUOTE_OK, SELL_QUOTE]})
+    ex._clock = lambda: t["now"]
+    await ex.sell_quote(1.0)
+    assert (await ex.sell_confirm("other"))["error"] == "no such pending sell quote"
+    await ex.sell_quote(1.0)
+    t["now"] += 16_000
+    assert "expired" in (await ex.sell_confirm("s-1"))["error"]
+    assert len(fake.called("prediction trade place-order")) == 1  # only the original buy
+
+
+async def test_selling_is_allowed_while_buys_are_stopped(tmp_path):
+    ex, fake, _ = await filled_position(tmp_path, {"prediction trade quote": [QUOTE_OK, SELL_QUOTE]})
+    ex.set_stopped(True)
+    assert (await ex.sell_quote(1.0))["quote_id"] == "s-1"
+
+
+async def test_sell_quote_without_position_or_in_shadow(tmp_path):
+    ex, _, _ = make(tmp_path)
+    assert (await ex.sell_quote(1.0))["error"] == "no open position"
+    sh, _, _ = make(tmp_path / "s" if (tmp_path / "s").mkdir() is None else tmp_path, live=False)
+    assert "live" in (await sh.sell_quote(1.0))["error"]
+
+
+async def test_failed_sell_keeps_the_position(tmp_path):
+    ex, _, j = await filled_position(tmp_path, {
+        "prediction trade quote": [QUOTE_OK, SELL_QUOTE],
+        "prediction trade place-order": [ORDER_OK, {"success": True, "data": {"orderId": "sell-3"}}],
+        "prediction order history": [history("FILLED"), {"success": True, "data": {"orders": [
+            {"orderId": "sell-3", "status": "FAILED", "errorMessage": "Failed to execute the market order"}]}}]})
+    await ex.sell_quote(1.0)
+    res = await ex.sell_confirm("s-1")
+    assert "Failed to execute" in res["error"] and j.row(rows(j)[0]["id"])["status"] == "filled"

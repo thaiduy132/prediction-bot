@@ -74,6 +74,12 @@
   .btn.go { border-color: var(--up); color: var(--up); }
   .pill { padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; background: var(--line); }
   .pill.ok { color: var(--up); } .pill.bad { color: var(--down); }
+  .posbox { margin: 10px 0; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); }
+  .posbox[hidden], .sellq[hidden] { display: none; }
+  .bigpnl { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .sellbtns { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+  .sellq { margin-top: 10px; padding: 10px; border: 1px dashed var(--warn); border-radius: 6px; }
+  .warn { color: var(--warn); }
 </style>
 </head>
 <body>
@@ -102,6 +108,29 @@
       <div class="tile"><span>Positions</span><b id="lvPos">—</b><small id="lvClaim">&nbsp;</small></div>
     </div>
     <div class="row">Open order <b id="lvOpen">—</b></div>
+    <div class="posbox" id="lvPosBox" hidden>
+      <div class="row">Position <b id="lvPosDesc">—</b></div>
+      <div class="row">Sell price now (bid) <b id="lvPosPx">—</b></div>
+      <div class="row">Value if sold now <b id="lvPosVal">—</b></div>
+      <div class="row">Profit if sold now <span class="bigpnl" id="lvPosPnl">—</span></div>
+      <div class="muted" id="lvPosNote" style="font-size:12px"></div>
+      <div class="sellbtns">
+        <button class="btn" id="lvSell50">Sell 50%</button>
+        <button class="btn stop" id="lvSell100">Sell 100%</button>
+      </div>
+      <div class="sellq" id="lvSellQ" hidden>
+        <div class="row">Binance quote <b id="lvQDesc">—</b></div>
+        <div class="row">You receive <b id="lvQGet">—</b></div>
+        <div class="row">Profit locked on the sold part <b id="lvQPnl">—</b></div>
+        <div class="row warn" id="lvQWarn"></div>
+        <div class="sellbtns">
+          <button class="btn go" id="lvQOk">Confirm sell</button>
+          <button class="btn" id="lvQNo">Cancel</button>
+          <span class="muted" id="lvQTtl"></span>
+        </div>
+      </div>
+      <div class="row" id="lvSellMsg"></div>
+    </div>
     <div class="row">Last action <b id="lvLast">—</b></div>
     <div class="tablewrap" style="max-height:260px;margin-top:10px">
       <table><thead><tr><th>Round</th><th>Side</th><th>Stake $</th><th>Decided</th><th>Price</th><th>Fee (sh)</th><th>Status</th><th>PnL $</th><th>Order</th></tr></thead>
@@ -313,7 +342,39 @@ function renderPaper() {
     : '<tr><td colspan="6" class="muted">No trades yet</td></tr>';
 }
 
-let wsConn = null;
+let wsConn = null, sellQuote = null, sellBusy = false;
+
+function renderPosition(L) {
+  const P = L.position, now = Date.now();
+  $('lvPosBox').hidden = !P;
+  if (!P) { sellQuote = null; return; }
+  $('lvPosDesc').textContent = `${P.side} · ${fmt(P.shares, 2)} shares @ ${fmt(P.avg_price, 3)} (cost ${fmt(P.shares * P.avg_price, 2)}$)` +
+    (P.sold_shares ? ` · already sold ${fmt(P.sold_shares, 2)} for ${fmt(P.sold_usd, 2)}$` : '') +
+    ` · round ends in ${mmss((P.ends_at - now) / 1000)}`;
+  $('lvPosPx').textContent = P.sell_price == null ? 'no bid right now' : fmt(P.sell_price, 3);
+  $('lvPosVal').textContent = P.value_now == null ? '—' : fmt(P.value_now, 3) + ' $ (fee ≈ ' + fmt(P.fee_est, 3) + ')';
+  $('lvPosPnl').textContent = P.pnl_if_sold == null ? '—' : sgn(P.pnl_if_sold, 3) + ' $';
+  $('lvPosPnl').className = 'bigpnl ' + cls(P.pnl_if_sold || 0);
+  $('lvPosNote').textContent = `Estimate from the live order book (${P.source === 'binance' ? 'shares from Binance' : 'shares estimated'}); ` +
+    'the exact amount is in the Binance quote shown before you confirm. If you hold, it pays 1$/share if ' + P.side + ' wins.';
+  const q = L.pending_sell || sellQuote;
+  const live = q && q.expires_at > now;
+  $('lvSellQ').hidden = !live;
+  $('lvSell50').disabled = $('lvSell100').disabled = sellBusy || P.sell_price == null;
+  if (live) {
+    $('lvQDesc').textContent = `sell ${fmt(q.shares, 2)} ${q.side} @ ${fmt(q.price, 3)} (fee ${q.fee == null ? '—' : fmt(q.fee, 4)})`;
+    $('lvQGet').textContent = fmt(q.proceeds, 3) + ' $';
+    $('lvQPnl').textContent = sgn(q.pnl_realized, 3) + ' $'; $('lvQPnl').className = cls(q.pnl_realized);
+    $('lvQWarn').textContent = q.warning || '';
+    $('lvQTtl').textContent = 'quote valid ' + Math.max(0, Math.round((q.expires_at - now) / 1000)) + 's';
+  }
+}
+
+function askSell(fraction) {
+  if (sellBusy) return;
+  $('lvSellMsg').textContent = 'asking Binance for a sell quote…';
+  sendCmd('sell_quote', { fraction });
+}
 function renderLive(L) {
   $('liveSec').hidden = !L;
   if (!L) return;
@@ -338,6 +399,7 @@ function renderLive(L) {
   $('lvPos').textContent = a.positions == null ? '—' : a.positions;
   $('lvClaim').textContent = a.pending_claim ? a.pending_claim + ' win(s) waiting to be claimed' : '';
   const open = rows.find(r => r.status === 'submitted' || r.status === 'filled');
+  renderPosition(L);
   $('lvOpen').textContent = open ? `${open.side} ${open.stake_usd}$ @ ~${fmt(open.quote_price, 3)} · settles in ${mmss((open.round_open + state.roundSec * 1000 - now) / 1000)}` : 'none';
   const la = L.last_action;
   $('lvLast').textContent = la ? `${hhmm(la.round_open)} ${la.result}: ${la.detail}` : '—';
@@ -394,7 +456,7 @@ function upsert(iv, c) {
 
 function setStatus(ok, text) { $('dot').className = 'dot' + (ok ? ' ok' : ''); $('statusText').textContent = text; }
 
-function sendCmd(cmd) { if (wsConn && wsConn.readyState === 1) wsConn.send(JSON.stringify({ cmd })); }
+function sendCmd(cmd, extra = {}) { if (wsConn && wsConn.readyState === 1) wsConn.send(JSON.stringify({ cmd, ...extra })); }
 
 function connect() {
   const ws = wsConn = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
@@ -430,11 +492,30 @@ function connect() {
       case 'book': state.book = m; renderBook(); break;
       case 'depth': renderDepth(m.imb); break;
       case 'paper': state.paper = m.paper; renderPaper(); break;
+      case 'sell_quote':
+        if (m.error) { $('lvSellMsg').textContent = 'Quote failed: ' + m.error; sellQuote = null; }
+        else { sellQuote = m; $('lvSellMsg').textContent = 'Review the Binance quote, then confirm.'; }
+        renderPaper(); break;
+      case 'sell_result':
+        sellBusy = false; sellQuote = null;
+        $('lvSellMsg').textContent = m.error ? 'Sell failed: ' + m.error :
+          `Sold ${fmt(m.shares, 2)} shares for ${fmt(m.usd, 3)} $` + (m.closed ? ' — position closed.' : '.');
+        renderPaper(); break;
       case 'conn': setStatus(m.connected, m.connected ? 'live' : 'feed reconnecting…'); break;
     }
   };
 }
 
+$('lvSell50').onclick = () => askSell(0.5);
+$('lvSell100').onclick = () => askSell(1);
+$('lvQNo').onclick = () => { sellQuote = null; $('lvSellMsg').textContent = 'Cancelled, nothing sold.'; $('lvSellQ').hidden = true; };
+$('lvQOk').onclick = () => {
+  const q = (state.paper && state.paper.live && state.paper.live.pending_sell) || sellQuote;
+  if (!q) return;
+  if (!confirm(`SELL ${fmt(q.shares, 2)} shares for about ${fmt(q.proceeds, 3)} $ (real money)?`)) return;
+  sellBusy = true; $('lvSellMsg').textContent = 'Sell order sent, waiting for Binance…';
+  sendCmd('sell_confirm', { quote_id: q.quote_id });
+};
 $('lvStop').onclick = () => {
   const stopped = $('lvStop').textContent.startsWith('Resume');
   if (!stopped || confirm('Resume REAL-MONEY orders?')) sendCmd(stopped ? 'resume' : 'stop');

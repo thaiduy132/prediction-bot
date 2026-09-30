@@ -114,7 +114,8 @@ class Dashboard:
         await ws.send(self.snapshot())
         async for raw in ws:  # the only messages accepted: STOP / RESUME of real orders
             try:
-                cmd = json.loads(raw).get("cmd")
+                msg = json.loads(raw)
+                cmd = msg.get("cmd")
             except (ValueError, AttributeError):
                 continue
             # Browsers let ANY website open a WebSocket to 127.0.0.1, so only this page may send commands.
@@ -125,6 +126,30 @@ class Dashboard:
             if self.executor is not None and cmd in ("stop", "resume"):
                 self.executor.set_stopped(cmd == "stop")
                 self._push_paper()
+            elif self.executor is not None and cmd == "sell_quote":
+                try:
+                    fraction = float(msg.get("fraction", 1.0))
+                except (TypeError, ValueError):
+                    continue
+                res = await self.executor.sell_quote(fraction)
+                await ws.send(json.dumps({"t": "sell_quote", **res}, default=str))
+                self._push_paper()
+            elif self.executor is not None and cmd == "sell_confirm":
+                qid = str(msg.get("quote_id", ""))
+                # the sell waits up to ~30s for Binance: do not block this socket meanwhile
+                asyncio.get_running_loop().create_task(self._sell(ws, qid))
+
+    async def _sell(self, ws: ServerConnection, quote_id: str) -> None:
+        assert self.executor is not None
+        try:
+            res = await self.executor.sell_confirm(quote_id)
+        except Exception as e:  # report instead of dying silently in a task
+            res = {"error": repr(e)}
+        try:
+            await ws.send(json.dumps({"t": "sell_result", **res}, default=str))
+        except Exception:
+            pass
+        self._push_paper()
 
     # ---- data -------------------------------------------------------------------
 
@@ -181,7 +206,7 @@ class Dashboard:
     def _paper_view(self) -> dict[str, Any]:
         assert self.paper is not None
         view = self.paper.snapshot()
-        view["live"] = None if self.executor is None else self.executor.status()
+        view["live"] = None if self.executor is None else self.executor.status(self.paper.last_odds)
         return view
 
     def _push_paper(self) -> None:
@@ -229,6 +254,7 @@ class Dashboard:
                         tasks.append(asyncio.create_task(self.executor.topic_loop()))
                         tasks.append(asyncio.create_task(self.executor.account_loop()))
                         tasks.append(asyncio.create_task(self.executor.reconcile_loop()))
+                        tasks.append(asyncio.create_task(self.executor.position_loop()))
                 if self.paper is not None:
                     tasks.append(asyncio.create_task(self._paper_ticker()))
                 async with serve(self._handler, self.host, self.port,
