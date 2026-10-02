@@ -22,6 +22,7 @@ import collections
 import datetime as dt
 import json
 import os
+import re
 import statistics as st
 import sys
 import time
@@ -47,6 +48,18 @@ def get(c: httpx.Client, url: str, params: dict | list | None = None, tries: int
         r.raise_for_status()
     r.raise_for_status()
     return {}
+
+
+def _timestamp(value: str | None) -> int | None:
+    if not value:
+        return None
+    return int(dt.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+
+
+def _weighted(rows: list[dict], key: str) -> float | None:
+    usable = [x for x in rows if x.get(key) is not None]
+    volume = sum(x["usd"] for x in usable)
+    return None if not volume else sum(x["usd"] * x[key] for x in usable) / volume
 
 
 def collect(max_markets: int, statuses: tuple[str, ...] = ("OPEN", "RESOLVED")) -> dict:
@@ -124,8 +137,17 @@ def maker_fills(data: dict) -> list[dict]:
     hist = {k: ([x["t"] for x in v], [x["p"] for x in v]) for k, v in data["history"].items()}
     for m in data["markets"]:
         mid = m["id"]
+        pm = data["poly"].get(m["polymarketConditionIds"][0], {})
+        game_start = _timestamp(pm.get("gameStartTime"))
+        question_date = re.search(r"20\d{2}-\d{2}-\d{2}", m.get("question", ""))
+        date_shift_days = None
+        if game_start is not None and question_date:
+            stated = dt.date.fromisoformat(question_date.group())
+            scheduled = dt.datetime.fromtimestamp(game_start, tz=dt.UTC).date()
+            date_shift_days = (scheduled - stated).days
         for e in data["trades"].get(str(mid), data["trades"].get(mid, [])):
-            t = int(dt.datetime.fromisoformat(e["executedAt"].replace("Z", "+00:00")).timestamp())
+            t = _timestamp(e["executedAt"])
+            assert t is not None
             for mk in e["makers"]:
                 k = int(mk["outcome"]["indexSet"]) - 1  # outcome index (0 = first outcome)
                 price = float(mk["price"]) / WEI
@@ -143,10 +165,23 @@ def maker_fills(data: dict) -> list[dict]:
                 fair = h[1][i]
                 if not 0 < cost < 1 or not 0 < fair < 1:
                     continue
+                markouts: dict[str, float | None] = {}
+                for label, seconds in (("markout_5m", 300), ("markout_30m", 1800), ("markout_2h", 7200)):
+                    j = bisect.bisect_right(h[0], t + seconds) - 1
+                    # Require a point after the fill and no more than 10 minutes before the target.
+                    markouts[label] = (None if j < 0 or h[0][j] <= t or t + seconds - h[0][j] > 600
+                                       else h[1][j] / cost - 1)
+                hours_to_start = None if game_start is None else (game_start - t) / 3600
                 status = mk["outcome"].get("status") if long_k == k else None
-                out.append(dict(kind=m["marketVariant"], market=mid, t=t, cost=cost, fair=fair, shares=shares,
+                out.append(dict(kind=m["marketVariant"], market=mid, title=m["title"], t=t,
+                                transaction=e.get("transactionHash"), cost=cost, fair=fair,
+                                fair_ts=h[0][i], fair_age_s=t - h[0][i], shares=shares,
                                 usd=shares * cost, edge=(fair - cost) / cost, signer=mk.get("signer"),
-                                taker_signer=e["taker"].get("signer"), resolved_won=status))
+                                taker_signer=e["taker"].get("signer"), game_start=game_start,
+                                hours_to_start=hours_to_start, date_shift_days=date_shift_days,
+                                phase=(None if hours_to_start is None else
+                                       "pre-game" if hours_to_start >= 0 else "in-play"),
+                                resolved_won=status, **markouts))
     return out
 
 
@@ -179,12 +214,75 @@ def report(fills: list[dict]) -> None:
         print("edge distribution of those fills:", {f"{lo:.0%}+": sum(1 for f in big if f['edge'] >= lo)
                                                     for lo in (0.07, 0.15, 0.3, 0.5)})
 
+    # Robust subset: observable before the game, excludes low-price noise, and uses a fresh reference.
+    candidates = [f for f in fills if f.get("hours_to_start") is not None and f["hours_to_start"] >= 1
+                  and f.get("fair_age_s", 10**9) <= 120 and 0.07 <= f["edge"] < 0.50]
+    shifted = [f for f in candidates if f.get("date_shift_days") is not None
+               and abs(f["date_shift_days"]) > 2]
+    eligible = [f for f in candidates if f not in shifted]
+    if not eligible:
+        return
+    print("\nrobustness audit: pre-game >= 1h, Polymarket age <= 120s, edge 7-50%, "
+          "event date shift <= 2d")
+    if shifted:
+        print(f"excluded postponed/rescheduled markets: {len({f['market'] for f in shifted})} markets, "
+              f"USD {sum(f['usd'] for f in shifted):.0f}; these were "
+              f"{sum(f['usd'] for f in shifted) / sum(f['usd'] for f in candidates):.1%} of candidate volume")
+    print(f"{'edge band':>10} {'fills':>7} {'markets':>8} {'$ volume':>10} {'$/day':>8} "
+          f"{'edge':>8} {'+5m':>8} {'+30m':>8} {'+2h':>8}")
+    for lo, hi in ((0.07, 0.15), (0.15, 0.50), (0.07, 0.50)):
+        rows = [f for f in eligible if lo <= f["edge"] < hi]
+        volume = sum(f["usd"] for f in rows)
+        values = [_weighted(rows, key) for key in ("edge", "markout_5m", "markout_30m", "markout_2h")]
+        shown = ["—" if x is None else f"{x:+.1%}" for x in values]
+        print(f"{f'{lo:.0%}-{hi:.0%}':>10} {len(rows):>7} {len({f['market'] for f in rows}):>8} "
+              f"{volume:>10.0f} {volume / span_days:>8.1f} " + " ".join(f"{x:>8}" for x in shown))
+
+    print("\nby market variant within the robust subset")
+    for kind in sorted({f["kind"] for f in eligible}):
+        rows = [f for f in eligible if f["kind"] == kind]
+        volume = sum(f["usd"] for f in rows)
+        markout = _weighted(rows, "markout_2h")
+        print(f"{kind:>20}: {len(rows):>4} fills, {volume / span_days:>6.1f}$/day, "
+              f"2h markout {'—' if markout is None else f'{markout:+.1%}'}")
+
+    total = sum(f["usd"] for f in eligible)
+    by_market = collections.Counter()
+    by_maker = collections.Counter()
+    by_taker = collections.Counter()
+    for f in eligible:
+        by_market[f["market"]] += f["usd"]
+        by_maker[f["signer"]] += f["usd"]
+        by_taker[f["taker_signer"]] += f["usd"]
+    top_mid, top_volume = by_market.most_common(1)[0]
+    title = next(f["title"] for f in eligible if f["market"] == top_mid)
+    print(f"concentration: top market {top_mid} ({title!r}) = {top_volume / total:.1%} of volume; "
+          f"top maker = {by_maker.most_common(1)[0][1] / total:.1%}; "
+          f"top taker = {by_taker.most_common(1)[0][1] / total:.1%}")
+
+    # Upper bound: assumes a new order gets $1 from every qualifying transaction despite the queue.
+    transactions: dict[str, list[dict]] = collections.defaultdict(list)
+    for f in eligible:
+        transactions[f["transaction"]].append(f)
+    capped_stake = capped_markout = 0.0
+    for rows in transactions.values():
+        volume = sum(f["usd"] for f in rows)
+        markout = _weighted(rows, "markout_2h")
+        if markout is not None:
+            stake = min(1.0, volume)
+            capped_stake += stake
+            capped_markout += stake * markout
+    if capped_stake:
+        print(f"$1/transaction upper bound: {len(transactions) / span_days:.1f} qualifying transactions/day, "
+              f"{capped_stake / span_days:.1f}$/day filled, 2h markout "
+              f"{capped_markout / capped_stake:+.1%} ({capped_markout / span_days:+.2f}$/day)")
+
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--max-markets", type=int, default=700)
+    ap.add_argument("--max-markets", type=int, default=800)
     ap.add_argument("--refresh", action="store_true")
-    ap.add_argument("--status", choices=("OPEN", "RESOLVED", "BOTH"), default="BOTH")
+    ap.add_argument("--status", choices=("OPEN", "RESOLVED", "BOTH"), default="OPEN")
     a = ap.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
     suffix = "" if a.status == "BOTH" else f"_{a.status.lower()}"

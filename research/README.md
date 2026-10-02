@@ -147,60 +147,72 @@ Với mỗi giao dịch quá khứ (`GET /v1/orders/matches`), mỗi phía maker
 - maker **Bid** phe k ở giá p: maker mua phe k với giá p;
 - maker **Ask** phe k ở giá p: maker thực chất mua phe kia với giá 1 − p.
 
-Giá công bằng là giá Polymarket (`clob.polymarket.com/prices-history`, độ phân giải 1 phút, trong vòng 15 phút trước lúc khớp). Lợi thế = `(giá công bằng − giá vốn) / giá vốn`. **Markout** là giá công bằng 5 phút, 30 phút, 2 giờ sau lúc khớp: nếu lợi thế là thật thì giá công bằng không quay về phía giá khớp.
+Giá tham chiếu là chuỗi giá Polymarket (`clob.polymarket.com/prices-history`, độ phân giải 1 phút). Lợi thế = `(giá tham chiếu − giá vốn) / giá vốn`. **Markout** là giá Polymarket 5 phút, 30 phút và 2 giờ sau lúc khớp. Audit chặt chỉ dùng giá tham chiếu không cũ quá 120 giây; thực tế 98,2% khối lượng có giá không cũ quá 60 giây.
 
-### 6.3 Kết quả (800 market, 72 ngày)
+### 6.3 Kết quả và kiểm định độ bền (800 market, 72 ngày)
 
-28.224 lệnh chờ đã khớp, khoảng 342.000$ (khoảng 4.700$/ngày).
+Chạy lại audit từ cache bằng `python research/predict_maker_study.py --max-markets 800 --status OPEN`; thêm `--refresh` để lấy lại dữ liệu mạng.
 
-| Lợi thế lúc khớp | Lúc khớp | +5 phút | +30 phút | +2 giờ | Kết luận |
-|---|---|---|---|---|---|
-| **Trước trận, 7–15%** (26.900$) | +8,1% | +7,9% | +7,9% | +7,8% | **lợi thế thật** |
-| Trước trận, 15–50% (3.800$) | +23,7% | +24,9% | +22,9% | +20,4% | thật, khối lượng nhỏ |
-| **Trong trận, 7–15%** | +11,1% | +0,6% | **−8,0%** | −7,4% | **bẫy**: giá Polymarket đã cũ, maker bị bắt |
+Toàn bộ mẫu có 28.224 maker fill, khoảng 342.000$ (4.746$/ngày). Con số thô ban đầu trông rất tốt: nhóm trước trận, edge 7–50% có 30.572$ khớp và markout 2 giờ +9,2%. Nhưng kết quả này không bền khi kiểm tra lịch thi đấu và mức tập trung.
 
-Nhóm lợi thế trên 50% phần lớn là giá rất thấp, nhiều khả năng là nhiễu đo, nên không tính.
+Bộ lọc audit: còn ít nhất 1 giờ trước trận, giá Polymarket không cũ quá 120 giây, edge từ 7% đến dưới 50%, và ngày trong câu hỏi không lệch `gameStartTime` quá 2 ngày.
 
-- Maker trước trận ở mức lệch ≥ 7% thực sự hưởng lợi. Phía khớp vào họ là hơn 1.100 tài khoản chủ động, nhiều khả năng là người dùng Binance Wallet đặt lệnh thị trường.
-- Maker trong trận thì lỗ, đúng như phần −3.185$ của bài viết.
+| Nhóm sau bộ lọc | Số fill | Market | Khối lượng | $/ngày | Edge lúc khớp | +5 phút | +30 phút | +2 giờ |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Edge 7–15% | 489 | 102 | 7.290$ | 101,1 | +9,3% | **−4,1%** | −4,7% | **−5,1%** |
+| Edge 15–50% | 538 | 78 | 3.047$ | 42,3 | +24,3% | +25,6% | +23,4% | **+20,2%** |
+| **Tổng 7–50%** | **1.027** | **134** | **10.338$** | **143,4** | **+13,7%** | +4,6% | +3,6% | **+2,3%** |
 
-### 6.4 Quy mô
+Tách theo cấu trúc market cho thấy khác biệt lớn:
 
-Luồng trước trận có lợi thế 7–50%, theo giải:
+| Biến thể | Khối lượng/ngày | Markout 2 giờ |
+|---|---:|---:|
+| `SPORTS_MATCH` | 64,6$ | **+14,0%** |
+| `SPORTS_TEAM_MATCH` | 78,2$ | **−7,4%** |
+| Esports | khoảng 0,6$ | mẫu quá nhỏ |
 
-| Giải | $/ngày | Lợi thế TB | Lời kỳ vọng/ngày (cho **tất cả** maker cộng lại) |
-|---|---|---|---|
-| MLS | 265 | +7,8% | 20,7$ |
-| KBO | 68 | +12,1% | 8,3$ |
-| FIFA (giao hữu/vòng loại) | 30 | — | 6,1$ |
-| UEFA Nations League | 28 | — | 3,3$ |
-| Esports | khoảng 2 | — | khoảng 0,25$ |
-| **Tổng** | **khoảng 425** | +10,0% | **khoảng 43$** |
+Các phát hiện làm yếu kết luận cũ:
 
-- Khoảng 43$/ngày cho cả thị trường, chia cho **257 maker** (3 maker lớn nhất chiếm 23–29%).
-- **Esports, nơi bài viết kiếm tiền, gần như không có giao dịch** trên Predict.fun.
-- **Vốn bị giữ lâu:** khớp trung vị **37 giờ trước trận** (p75 khoảng 67 giờ), cộng thời gian chờ chốt (có market từ tháng 8 vẫn chưa chốt). Chiếm 10% luồng (khoảng 40$/ngày) cần khoảng **150–300$** vốn khóa liên tục, để kiếm khoảng **4$/ngày kỳ vọng**.
-- Với 15$: kỳ vọng khoảng 0,2–0,5$/ngày, chưa trừ lỗi bot, rủi ro một phe, trận bị hủy.
+- Bốn market hoãn/đổi lịch chiếm **66,2%** khối lượng ứng viên. Riêng market “FC Cincinnati thắng ngày 05/09”, nhưng `gameStartTime` chuyển sang 21/10, chiếm 62,3% khối lượng trước khi loại. Một fill 18.593$ tạo phần lớn lợi nhuận thống kê.
+- Sau khi loại các market đổi lịch, market KBO lớn nhất vẫn chiếm 29,5% khối lượng. Kết quả còn nhạy với vài giao dịch khối.
+- Edge 7–15% tổng hợp **không đứng vững**; phần âm tập trung ở `SPORTS_TEAM_MATCH`. Tín hiệu còn lại nằm chủ yếu ở `SPORTS_MATCH` và nhóm edge 15–50%.
+- Nhóm edge trên 50% phần lớn là hợp đồng giá rất thấp và hiệu ứng tick, nên loại khỏi audit.
+- Trong trận vẫn là bẫy adverse selection; không dùng cho chiến lược này.
 
-### 6.5 Kết luận
+### 6.4 Quy mô thực tế
 
-1. Phương pháp **có tác dụng trên Predict.fun**: giá Polymarket là giá công bằng tốt, maker không mất phí, và lợi thế trước trận được markout xác nhận.
-2. Quy tắc nếu làm: chỉ đặt lệnh **trước trận**, **hủy hết trước giờ thi đấu**, lệch ≥ 7–8% so với Polymarket, ưu tiên MLS và KBO.
-3. **Không hợp với vốn nhỏ:** cả thị trường chỉ khoảng 43$/ngày, vốn khóa nhiều ngày, chia với hơn 250 maker.
+Ước tính cũ “43$/ngày” là mark-to-market của toàn bộ maker và bị giao dịch hoãn trận chi phối, nên không dùng làm kỳ vọng cho bot mới.
+
+Sau bộ lọc, toàn thị trường có 143,4$/ngày khối lượng đã khớp; markout 2 giờ +2,3% tương đương khoảng **3,3$/ngày cho tất cả maker cộng lại**. Bot mới đứng sau hàng đợi giá-thời gian nên chỉ lấy được một phần chưa biết của con số này.
+
+Một trần rất lạc quan, giả sử bot khớp được 1$ ở mọi giao dịch đủ điều kiện, cho 12,8 cơ hội/ngày, 10,3$ khớp/ngày và markout khoảng **+1,70$/ngày**. Đây vẫn chưa phải lợi nhuận chốt thật và giả định hàng đợi không có cạnh tranh.
+
+- Esports gần như không có thanh khoản.
+- Vốn có thể bị giữ nhiều ngày tới khi market chốt.
+- Với vốn 15$, dữ liệu hiện tại chưa đủ để đưa ra kỳ vọng lợi nhuận đáng tin; nút thắt là xác suất được khớp và rủi ro lịch/settlement.
+
+### 6.5 Kết luận nghiên cứu
+
+1. Có một ứng viên đáng forward-test: maker trên **`SPORTS_MATCH` trước trận** theo giá Polymarket. Chưa có đủ bằng chứng để chạy tiền thật vì quy tắc được chọn trên chính mẫu này, chưa có kết quả chốt và chưa mô hình hóa hàng đợi.
+2. Quy tắc paper đề xuất: chỉ khi còn trên 1 giờ; giá tham chiếu ≤ 120 giây; edge 7–50%; loại market đổi lịch trên 2 ngày; giá limit tối đa = `fair / (1 + min_edge)` làm tròn xuống tick; hủy ngay khi edge mất hoặc lịch đổi.
+3. Tạm loại `SPORTS_TEAM_MATCH`, mọi market trong trận và edge ≥ 50%. Cược giả lập tối đa 1$ mỗi market để đo đúng bài toán vốn nhỏ.
+4. Chỉ xem xét live sau một giai đoạn mới hoàn toàn ngoài mẫu, có fill theo hàng đợi và kết quả settlement thật.
 
 ### 6.6 Chưa kiểm chứng
 
-- `baw` có cho **lệnh LIMIT nằm chờ** trên market thể thao không.
-- **Kết quả chốt thật:** markout so với Polymarket là bằng chứng mạnh nhưng chưa phải kết quả trận. Lần chạy chỉ lấy market đã chốt ra 32 market và không có lệnh khớp nào, vì market thể thao Predict.fun chốt rất chậm.
-- Cạnh tranh hàng đợi: lệnh của mình đứng sau lệnh cùng giá của maker khác.
+- **Kết quả chốt thật:** markout Polymarket là bằng chứng trung gian, chưa phải PnL cuối cùng. Mẫu `RESOLVED` hiện chưa có fill dùng được.
+- **Hàng đợi:** lịch sử chỉ cho biết maker đã đứng sẵn được khớp; chưa cho biết lệnh mới đứng sau bao nhiêu tiền và xác suất khớp.
+- **Giá thực thi Polymarket:** `prices-history` là chuỗi giá phút, không phải ảnh chụp bid/ask có kích thước tại đúng thời điểm.
+- [Binance Prediction Trading REST API](https://developers.binance.com/en/docs/catalog/web3-wallet-prediction-trading/api/rest-api/trade) có lệnh `LIMIT` với `GTC`, nhưng chưa xác nhận CLI `baw` đang dùng trong repo hỗ trợ đầy đủ đặt, theo dõi và hủy lệnh prediction limit.
+- Trận hoãn/hủy và quy tắc settlement có thể tạo chênh lệch hợp lý giữa hai sàn.
 - Luật cá cược thể thao nơi người chạy bot sinh sống và điều khoản của sàn.
 
 ### 6.7 Bước tiếp theo đề xuất
 
-1. Ghi liên tục sổ lệnh Predict.fun và giá Polymarket cho MLS/KBO để đo cơ hội về phía trước.
-2. Mô phỏng maker trên giấy, có mô hình khớp lệnh và hàng đợi.
-3. Thử một lệnh LIMIT nhỏ (khoảng 1$) trên một trận MLS trước giờ đá, ở giá Polymarket − 8%, hủy nếu chưa khớp trước giờ đá 1 tiếng. Mục đích là xác nhận lệnh chờ và phí 0. Đây là tiền thật, người dùng tự chạy.
-4. Vài tuần sau, khi các market đã chốt, kiểm tra lại lợi thế bằng kết quả trận thật.
+1. Ghi đồng thời order book Predict.fun, best bid/ask Polymarket, `gameStartTime` và mọi thay đổi lịch.
+2. Paper forward-test `SPORTS_MATCH` ít nhất 2–4 tuần; mô phỏng price-time queue và chỉ tính fill khi luồng taker vượt lượng tiền đứng trước.
+3. Theo dõi riêng markout 5 phút, 2 giờ và PnL settlement; khóa quy tắc trước khi xem kết quả.
+4. Chỉ sau khi paper đạt đủ số market mới thử một limit 1$ để xác nhận phí maker, hành vi partial fill, hủy lệnh và thời gian hoàn vốn.
 
 ### Ghi chú kỹ thuật
 
