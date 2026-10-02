@@ -13,7 +13,8 @@ from dataclasses import dataclass
 from bot.backtest.calibration import SIGMA_WINDOW_S, CalibrationTable, build_table, load_table, save_tables
 from bot.backtest.engine import run_backtest
 from bot.backtest.stats import summarize
-from bot.backtest.strategy import BookParams, Strategy, Value, ValueParams, make_strategy
+from bot.backtest.strategy import (BookParams, MomentumValue, MomentumValueParams, Strategy, Value, ValueParams,
+                                   make_strategy)
 from bot.clock_sync import describe_offset, keep_clock_synced, sync_clock
 from bot.config import AppConfig, load_config
 from bot.data.binance_rest import BinanceRestClient
@@ -32,7 +33,7 @@ from bot.timeutil import ceil_to, floor_to, interval_ms, local_ms, ms_to_iso, no
 log = logging.getLogger("bot")
 
 MODES = ("backtest", "paper", "shadow", "live")
-STRATEGIES = ("momentum", "reversal", "always_up", "book", "momentum_book", "value")
+STRATEGIES = ("momentum", "reversal", "always_up", "book", "momentum_book", "value", "momentum_value")
 
 
 def _rest(cfg: AppConfig) -> BinanceRestClient:
@@ -111,16 +112,20 @@ def _strategy_params(cfg: AppConfig, args: argparse.Namespace) -> StrategyParams
     decision_s = args.decision_s or bt.decision_s
     use_odds = args.odds or bt.use_odds
     fee_bps = bt.fee_bps if args.fee_bps is None else args.fee_bps
-    if name == "value":
+    if name in ("value", "momentum_value"):
         if not use_odds:
-            raise SystemExit("Chiến lược value so xác suất với giá thị trường, nên cần odds: thêm --odds "
+            raise SystemExit(f"Chiến lược {name} so xác suất với giá thị trường, nên cần odds: thêm --odds "
                              "(hoặc backtest.use_odds: true).")
         try:
             table = load_table(bt.calibration_path, decision_s)
         except (FileNotFoundError, KeyError) as e:
             raise SystemExit(str(e).strip("'\"")) from None
         min_edge = bt.min_edge if args.min_edge is None else args.min_edge
-        strategy: Strategy = Value(table, ValueParams(fee_bps, min_edge, bt.min_samples))
+        strategy: Strategy = (
+            Value(table, ValueParams(fee_bps, min_edge, bt.min_samples)) if name == "value" else
+            MomentumValue(table, MomentumValueParams(fee_bps / 10_000, bt.momentum_value_min_ev
+                                                     if args.min_edge is None else args.min_edge,
+                                                     bt.min_samples, min_move)))
     else:
         strategy = make_strategy(name, min_move, book_params)
     return StrategyParams(
@@ -195,7 +200,7 @@ async def cmd_backtest(cfg: AppConfig, args: argparse.Namespace) -> int:
     finally:
         cache.close()
 
-    if isinstance(strategy, Value):
+    if isinstance(strategy, (Value, MomentumValue)):
         t = strategy.table
         if parse_utc(t.start) < end_ms and start_ms < parse_utc(t.end):
             print(f"CẢNH BÁO: khoảng backtest trùng khoảng hiệu chỉnh ({t.start} .. {t.end}); kết quả sẽ đẹp hơn "
@@ -208,6 +213,8 @@ async def cmd_backtest(cfg: AppConfig, args: argparse.Namespace) -> int:
         "decision_s": decision_s, "min_move_bps": min_move,
         **({"calibration": strategy.table.label, "min_edge": strategy.params.min_edge}
            if isinstance(strategy, Value) else {}),
+        **({"calibration": strategy.table.label, "min_ev": strategy.params.min_ev}
+           if isinstance(strategy, MomentumValue) else {}),
         **({"pricing": "predict.fun odds", "odds_samples": len(odds_samples), "max_entry_price": max_price}
            if odds_samples is not None else {"pricing": "fixed payout", "payout_ratio": payout}),
         **({"book": {"levels": book_params.levels, "window_s": book_params.window_s,
@@ -258,10 +265,18 @@ def _build_executor(cfg: AppConfig, args: argparse.Namespace, live: bool, strate
     round_ms = interval_ms(cfg.market.round_interval)
     executor = LiveExecutor(
         ExecConfig(live, lc.chain_id, lc.stake_usd, lc.slippage_bps, lc.max_price_slippage, lc.deadline_ms,
-                   max_retries=lc.max_retries, retry_window_ms=lc.retry_window_s * 1000),
+                   max_retries=lc.max_retries, retry_window_ms=lc.retry_window_s * 1000,
+                   retry_max_price=lc.retry_max_price),
         baw, journal, RiskManager(limits, journal), tokens=lambda r: None,
         slug_for=lambda r: round_slug(cfg.market.symbol, round_ms // 1000, r // 1000), round_ms=round_ms)
+    from bot.live.sizing import StakeScaling
+
+    executor.scaling = StakeScaling(lc.stake_usd, lc.scale_base_capital_usd, lc.scale_step_multiple,
+                                    lc.scale_factor, lc.max_stake_usd)
     if live:
+        if lc.scale_base_capital_usd:
+            print(f"Tăng cược theo vốn: vốn gốc {lc.scale_base_capital_usd}$, mỗi lần x{lc.scale_step_multiple} "
+                  f"thì cược x{lc.scale_factor} (tối đa {lc.max_stake_usd}$)", file=sys.stderr)
         print(f"LIVE (TIỀN THẬT): {strategy_name}, {lc.stake_usd}$/lệnh, lỗ tối đa {lc.max_daily_loss_usd}$/ngày, "
               f"tối đa {lc.max_bets_per_day} lệnh/ngày. Dừng khẩn cấp: tạo file {lc.kill_switch_path}", file=sys.stderr)
         if strategy_name != "value":

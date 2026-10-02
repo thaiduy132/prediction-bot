@@ -108,6 +108,8 @@ class BacktestConfig(_Strict):
     calibration_path: Path = Path("data/calibration.json")  # built by `python -m bot data calibrate`
     min_edge: float = Field(0.03, ge=0)  # required expected profit per unit staked, after fee
     min_samples: int = Field(100, ge=1)  # ignore |z| buckets measured on fewer rounds
+    # momentum_value: follow the move only when expected profit (real fee formula) >= this
+    momentum_value_min_ev: float = Field(0.0, ge=-0.5)
     # order-book strategies (need recorded data, see `python -m bot data record`)
     book_levels: int = Field(10, description="1 | 5 | 10 | 20 levels used for imbalance")
     book_window_s: int = Field(10, gt=0)  # average imbalance over the last N seconds
@@ -130,7 +132,13 @@ class LiveConfig(_Strict):
     # Real orders go through the Binance Agentic Wallet CLI; sign in first with `baw auth signin`.
     baw_path: str = "baw"
     chain_id: int = 56  # BNB Smart Chain, where Predict.fun markets live
-    stake_usd: float = Field(1.0, gt=0)  # per bet
+    stake_usd: float = Field(1.0, gt=0)  # per bet (base stake when scaling is on)
+    # Stake scaling: every time equity reaches base_capital x step_multiple^k, stake = stake_usd x factor^k
+    # (and back down when equity falls below the step). None = fixed stake.
+    scale_base_capital_usd: float | None = None
+    scale_step_multiple: float = Field(2.0, gt=1)
+    scale_factor: float = Field(1.5, gt=0)
+    max_stake_usd: float = Field(5.0, gt=0)
     max_daily_loss_usd: float = Field(3.0, gt=0)  # worst case, open bets counted as lost
     max_bets_per_day: int = Field(20, ge=1)
     max_open_positions: int = Field(1, ge=1)
@@ -139,6 +147,7 @@ class LiveConfig(_Strict):
     deadline_ms: int = Field(5_000, gt=0)  # give up if not sent this long after the decision
     max_retries: int = Field(3, ge=0)  # re-send (fresh quote) when Binance marks an order FAILED
     retry_window_s: int = Field(60, gt=0)  # no retry later than this after the decision
+    retry_max_price: float = Field(0.85, gt=0, le=1)  # momentum retries: never pay more than this per share
     kill_switch_path: Path = Path("data/STOP")  # create this file to stop new orders immediately
     journal_path: Path = Path("data/live.sqlite")
 

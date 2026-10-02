@@ -12,7 +12,7 @@ from typing import Protocol
 
 from bot.backtest.calibration import CalibrationTable, sigma_bps, z_score
 from bot.backtest.features import book_features
-from bot.backtest.pricing import Side, entry_price
+from bot.backtest.pricing import Side, entry_price, expected_profit
 from bot.data.book_store import BookSample
 from bot.data.odds_store import OddsSample
 from bot.models import Kline
@@ -116,6 +116,14 @@ class Momentum:
             up = not up
         return Side.UP if up else Side.DOWN
 
+    def accept_retry(self, ctx: RoundContext, side: Side, price: float, max_price: float) -> str | None:
+        """A retry after a failed order is a fresh decision: same direction now, and not too expensive."""
+        if self.decide(ctx) is not side:
+            return f"move no longer points {side.value} ({ctx.move_bps:+.2f} bps)"
+        if price > max_price:
+            return f"price {price:.3f} above the retry cap {max_price:.2f}"
+        return None
+
 
 @dataclass(frozen=True, slots=True)
 class AlwaysUp:
@@ -155,18 +163,22 @@ class Value:
     def __repr__(self) -> str:  # short and stable: used as the paper-trading history label
         return f"Value({self.table.label}, {self.params})"
 
-    def estimate(self, ctx: RoundContext) -> tuple[Side, float, float] | None:
-        """(side the move points to, calibrated P(that side wins), z) or None if not estimable."""
-        if (ctx.decision_time - ctx.round_open_time) // 1000 != self.table.decision_s:
-            raise ValueError(f"calibration is for second {self.table.decision_s}, decision is at "
-                             f"{(ctx.decision_time - ctx.round_open_time) // 1000}")
+    def estimate(self, ctx: RoundContext, strict: bool = True) -> tuple[Side, float, float] | None:
+        """(side the move points to, calibrated P(that side wins), z) or None if not estimable.
+
+        strict=False (retries a few seconds later) uses the time actually left in the round: z already
+        scales the move by sqrt(time left), so the table measured at decision_s is a close approximation.
+        """
+        elapsed = (ctx.decision_time - ctx.round_open_time) // 1000
+        if strict and elapsed != self.table.decision_s:
+            raise ValueError(f"calibration is for second {self.table.decision_s}, decision is at {elapsed}")
         sig = sigma_bps(ctx.lookback)
         move = ctx.move_bps
         if sig is None or move == 0:
             return None
-        z = z_score(move, sig, self.table.round_s - self.table.decision_s)
-        b = self.table.lookup(abs(z))
-        if b.n < self.params.min_samples:
+        z = z_score(move, sig, self.table.round_s - (self.table.decision_s if strict else elapsed))
+        b = self.table.lookup_pooled(abs(z), self.params.min_samples)
+        if b.n < self.params.min_samples:  # the whole table is too small
             return None
         return (Side.UP if move > 0 else Side.DOWN), b.rate, z
 
@@ -187,6 +199,89 @@ class Value:
                 best = (side, ev)
         return None if best is None else best[0]
 
+    def accept_retry(self, ctx: RoundContext, side: Side, price: float, max_price: float) -> str | None:
+        """Re-estimate the win probability NOW and require the same edge at the NEW price."""
+        est = self.estimate(ctx, strict=False)
+        if est is None:
+            return "cannot re-estimate the probability now"
+        follow, p, _ = est
+        q = p if side is follow else 1.0 - p
+        ev = q / price - 1 - self.params.fee_bps / 10_000
+        if ev < self.params.min_edge:
+            return f"no edge left at {price:.3f} (win prob now ~{q:.2f}, expected {ev:+.1%})"
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class MomentumValueParams:
+    fee_rate: float = 0.02  # Predict.fun feeRateBps 200, applied with the real formula (pricing.buy_fee_fraction)
+    min_ev: float = 0.0  # required expected profit per 1$ after the fee
+    min_samples: int = 100  # ignore |z| buckets calibrated on fewer rounds than this
+    min_move_bps: float = 1.0  # same floor as momentum
+
+
+@dataclass(frozen=True, slots=True)
+class MomentumValue:
+    """Momentum, but only when the price is below the calibrated chance that the move holds.
+
+    At the decision second: the side the move points to (like `momentum`), its win probability p from
+    the |z| calibration table (like `value`), and its ask. Buy it only if
+        p / price * (1 - fee fraction) - 1 >= min_ev
+    Never bets against the move: in paper trading the `value` fades (cheap long shots) carried most of
+    its variance. On 420 momentum paper trades this filter kept 172, +14.1%/trade vs +3.0% unfiltered.
+    """
+
+    table: CalibrationTable
+    params: MomentumValueParams = MomentumValueParams()
+    name: str = "momentum_value"
+    needs_book: bool = False
+    needs_odds: bool = True
+
+    def __repr__(self) -> str:  # short and stable: used as the paper-trading history label
+        return f"MomentumValue({self.table.label}, {self.params})"
+
+    def _edge(self, ctx: RoundContext, strict: bool) -> tuple[Side, float, float] | str:
+        """(follow side, win prob, expected profit at the current ask) or the reason there is none."""
+        if abs(ctx.move_bps) < self.params.min_move_bps:
+            return "move too small"
+        est = Value(self.table, ValueParams(min_samples=self.params.min_samples)).estimate(ctx, strict=strict)
+        if est is None:
+            return "cannot estimate the win probability"
+        side, p, _ = est
+        if ctx.quote is None:
+            return "no quote"
+        price = entry_price(side, ctx.quote)
+        if price is None or not 0 < price < 1:
+            return "nothing to buy on that side"
+        return side, p, expected_profit(p, price, self.params.fee_rate)
+
+    def decide(self, ctx: RoundContext) -> Side | None:
+        e = self._edge(ctx, strict=True)
+        if isinstance(e, str):
+            return None
+        side, _, ev = e
+        return side if ev >= self.params.min_ev else None
+
+    def accept_retry(self, ctx: RoundContext, side: Side, price: float, max_price: float) -> str | None:
+        """Retry = fresh decision: the move must still point to `side` and the NEW price must keep the edge."""
+        if abs(ctx.move_bps) < self.params.min_move_bps or (ctx.move_bps > 0) != (side is Side.UP):
+            return f"move no longer points {side.value} ({ctx.move_bps:+.2f} bps)"
+        est = Value(self.table, ValueParams(min_samples=self.params.min_samples)).estimate(ctx, strict=False)
+        if est is None:
+            return "cannot re-estimate the probability now"
+        ev = expected_profit(est[1], price, self.params.fee_rate)
+        if ev < self.params.min_ev:
+            return f"no edge left at {price:.3f} (win prob now ~{est[1]:.2f}, expected {ev:+.1%})"
+        return None
+
+
+def accept_retry(strategy: Strategy, ctx: RoundContext, side: Side, price: float, max_price: float) -> str | None:
+    """None if a retry at `price` is still a good bet for `strategy`, else why not."""
+    check = getattr(strategy, "accept_retry", None)
+    if check is not None:
+        return check(ctx, side, price, max_price)
+    return None if price <= max_price else f"price {price:.3f} above the retry cap {max_price:.2f}"
+
 
 def make_strategy(name: str, min_move_bps: float, book: BookParams = BookParams()) -> Strategy:
     match name:
@@ -200,6 +295,6 @@ def make_strategy(name: str, min_move_bps: float, book: BookParams = BookParams(
             return BookImbalance(book)
         case "momentum_book":
             return MomentumBook(min_move_bps, book)
-        case "value":
-            raise ValueError("the value strategy needs a calibration table: build Value(table, ValueParams(...))")
+        case "value" | "momentum_value":
+            raise ValueError(f"the {name} strategy needs a calibration table: build it with its table")
     raise ValueError(f"unknown strategy {name!r} (momentum | reversal | always_up | book | momentum_book | value)")

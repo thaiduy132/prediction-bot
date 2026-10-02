@@ -250,6 +250,7 @@ class Dashboard:
                         self.executor.tokens = lambda r: poller.outcome_tokens(r)  # type: ignore[assignment,return-value]
                         self.paper.on_entry = self.executor.on_entry
                         self.paper.on_settle = self.executor.on_settle
+                        self.executor.recheck = self.paper.recheck
                         tasks.append(asyncio.create_task(self.executor.redeem_loop()))
                         tasks.append(asyncio.create_task(self.executor.topic_loop()))
                         tasks.append(asyncio.create_task(self.executor.account_loop()))

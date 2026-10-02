@@ -539,3 +539,121 @@ async def test_failed_sell_keeps_the_position(tmp_path):
     await ex.sell_quote(1.0)
     res = await ex.sell_confirm("s-1")
     assert "Failed to execute" in res["error"] and j.row(rows(j)[0]["id"])["status"] == "filled"
+
+
+# ---- retries are re-decided on the current situation ----------------------------------------------
+
+async def test_retry_buys_at_a_higher_price_when_the_strategy_still_agrees(tmp_path):
+    # the case seen live: first order FAILED, then the price ran 0.56 -> 0.71 in our favour
+    quotes = [QUOTE_OK, {"success": True, "data": {"quoteId": "q-2", "averagePrice": "0.71", "feeAmount": "0.01"}}]
+    ex, fake, j = make(tmp_path, replies={"prediction order history": hist_seq("FAILED", "FILLED"),
+                                          "prediction trade quote": quotes})
+    seen = []
+    ex.recheck = lambda b, price, cap: seen.append((b.side, price, cap)) or None  # strategy says: still buy
+    await ex.execute(bet(Side.UP, 0.55))
+    assert len(fake.called("prediction trade place-order")) == 2 and rows(j)[-1]["status"] == "filled"
+    assert seen == [(Side.UP, 0.71, 0.85)]
+
+
+async def test_retry_is_dropped_when_the_strategy_no_longer_agrees(tmp_path):
+    quotes = [QUOTE_OK, {"success": True, "data": {"quoteId": "q-2", "averagePrice": "0.90", "feeAmount": "0.01"}}]
+    ex, fake, j = make(tmp_path, replies={"prediction order history": hist_seq("FAILED"),
+                                          "prediction trade quote": quotes})
+    ex.recheck = lambda b, price, cap: f"price {price:.3f} above the retry cap {cap:.2f}" if price > cap else None
+    await ex.execute(bet(Side.UP, 0.55))
+    assert len(fake.called("prediction trade place-order")) == 1
+    assert rows(j)[-1]["reason"] == "retry 1/3: price 0.900 above the retry cap 0.85"
+
+
+async def test_first_attempt_still_uses_the_decision_price_tolerance(tmp_path):
+    ex, fake, j = make(tmp_path)
+    ex.recheck = lambda *a: None
+    await ex.execute(bet(Side.UP, 0.50))  # quote 0.55 > 0.50 + 0.02 on the FIRST attempt
+    assert not fake.called("prediction trade place-order") and "price moved" in rows(j)[0]["reason"]
+
+
+def test_momentum_and_value_retry_rules():
+    from bot.backtest.calibration import empty_buckets, CalibrationTable
+    from bot.backtest.strategy import Momentum, RoundContext, Value, ValueParams
+    from bot.models import Kline
+
+    def k(t, px):
+        return Kline("BTCUSDT", "1s", t, t + 999, px, px, px, px, 1, 1, 1, 1, 1)
+
+    zig = [k(T0 - 300_000 + i * 1000, 100.0 + (0.01 if i % 2 else -0.01)) for i in range(300)]
+    def ctx(last_px, second=75, quote=None):
+        dt_ = T0 + second * 1000
+        recent = [k(T0 + i * 1000, 100.0) for i in range(second - 1)] + [k(dt_ - 1000, last_px)]
+        look = [x for x in zig + recent if dt_ - 300_000 <= x.open_time < dt_]
+        return RoundContext(T0, 100.0, dt_, recent, (), look, quote)
+
+    m = Momentum(1.0)
+    assert m.accept_retry(ctx(100.2), Side.UP, 0.71, 0.85) is None
+    assert "above the retry cap" in m.accept_retry(ctx(100.2), Side.UP, 0.90, 0.85)
+    assert "no longer points UP" in m.accept_retry(ctx(99.8), Side.UP, 0.40, 0.85)
+
+    b = empty_buckets()
+    for x in b:
+        x.n, x.wins = 1000, 900  # every |z| bucket: following the move wins 90%
+    v = Value(CalibrationTable(60, 300, "close_gte_open", "BTCUSDT", "a", "b", b), ValueParams(fee_bps=200))
+    assert v.accept_retry(ctx(100.2), Side.UP, 0.71, 0.85) is None  # 0.9/0.71 - 1.02 = +24.8%
+    assert "no edge left" in v.accept_retry(ctx(100.2), Side.UP, 0.89, 0.85)  # 0.9/0.89 - 1.02 < 3%
+
+
+def test_paper_trader_recheck_uses_the_latest_second():
+    from bot.backtest.strategy import Momentum
+    from bot.models import Kline
+    from bot.paper.trader import OpenBet, PaperTrader
+    from bot.settlement import SettlementRule
+
+    tr = PaperTrader(Momentum(1.0), SettlementRule.CLOSE_GTE_OPEN, decision_s=60, clock=lambda: NOW)
+    tr.on_kline(Kline("BTCUSDT", "5m", T0, T0 + 299_999, 100, 100, 100, 100, 1, 1, 1, 1, 1, False))
+    for i in range(80):  # price went up, then by second 79 it is back below the open
+        px = 100.2 if i < 70 else 99.9
+        tr._seconds[T0 + i * 1000] = Kline("BTCUSDT", "1s", T0 + i * 1000, T0 + i * 1000 + 999, px, px, px, px,
+                                           1, 1, 1, 1, 1)
+    assert tr.current_context(T0).decision_time == T0 + 80_000
+    assert "no longer points UP" in tr.recheck(OpenBet(T0, Side.UP, 0.6, 20.0, NOW), 0.65, 0.85)
+    assert tr.recheck(OpenBet(T0, Side.DOWN, 0.4, -10.0, NOW), 0.45, 0.85) is None
+
+
+# ---- stake scaling with the account ---------------------------------------------------------------
+
+def test_stake_steps_up_at_each_doubling_and_back_down():
+    from bot.live.sizing import StakeScaling
+    s = StakeScaling(1.0, 11.28, 2.0, 1.5, 5.0)
+    assert s.stake(None) == 1.0 and s.stake(13.96) == 1.0 and s.stake(22.55) == 1.0
+    assert s.stake(22.56) == 1.5 and s.next_threshold(22.56) == 45.12
+    assert s.stake(45.12) == 2.25 and s.stake(90.24) == 3.38
+    assert s.stake(10_000) == 5.0 and s.next_threshold(10_000) is None  # capped
+    assert s.stake(20.0) == 1.0  # fell back below 2x: back to the base stake
+    assert StakeScaling(1.0).stake(1_000) == 1.0 and StakeScaling(1.0).next_threshold(1_000) is None  # off
+
+
+async def test_executor_bets_the_scaled_stake_and_risk_checks_it(tmp_path):
+    from bot.live.sizing import StakeScaling
+    ex, fake, j = make(tmp_path, replies={"prediction order history": hist_seq("FILLED")})
+    ex.scaling = StakeScaling(1.0, 11.28, 2.0, 1.5, 5.0)
+    ex.account["usdt"] = 23.0  # >= 22.56
+    await ex.execute(bet())
+    q = fake.called("prediction trade quote")[0]
+    assert q[q.index("--amount") + 1] == "1.5" and rows(j)[0]["stake_usd"] == 1.5
+    s = ex.status()
+    assert s["stake_usd"] == 1.5 and s["scaling"]["tier"] == 1 and s["scaling"]["next_step_at_usd"] == 45.12
+
+
+async def test_open_stake_counts_toward_equity(tmp_path):
+    from bot.live.sizing import StakeScaling
+    ex, _, _ = make(tmp_path, replies={"prediction order history": hist_seq("FILLED")})
+    ex.scaling = StakeScaling(1.0, 11.28, 2.0, 1.5, 5.0)
+    ex.account["usdt"] = 22.0
+    assert ex.current_stake() == 1.0
+    await ex.execute(bet())  # 1$ now sits in an open position: 22 + 1 = 23 >= 22.56
+    assert ex.equity_usd() == 23.0 and ex.current_stake() == 1.5
+
+
+async def test_attempt_without_an_explicit_stake_uses_the_configured_one(tmp_path):
+    ex, fake, j = make(tmp_path, live=False)
+    await ex._attempt(bet(), 0)
+    q = fake.called("prediction trade quote")[0]
+    assert q[q.index("--amount") + 1] == "1" and rows(j)[0]["stake_usd"] == 1.0

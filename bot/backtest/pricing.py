@@ -25,6 +25,18 @@ def entry_price(side: Side, q: OddsSample) -> float | None:
     return None if q.up_bid is None else 1.0 - q.up_bid
 
 
+def buy_fee_fraction(price: float, rate: float = 0.02) -> float:
+    """Share of the bought shares taken as fee, as measured on real Binance quotes (2026-09-30):
+    fee = rate * min(p, 1 - p) / p of the shares. Cheap sides pay `rate`; favourites pay much less."""
+    return rate * min(price, 1.0 - price) / price
+
+
+def expected_profit(win_prob: float, price: float, rate: float = 0.02) -> float:
+    """Expected profit per 1$ staked when buying at `price` a side that wins with `win_prob`,
+    after the real fee (only the winning payout is reduced)."""
+    return win_prob / price * (1.0 - buy_fee_fraction(price, rate)) - 1.0
+
+
 def bet_pnl(side: Side, outcome: Outcome, price: float, fee_bps: float = 0.0) -> float:
     """Profit per 1 unit staked. `fee_bps` is charged on the stake of every executed bet.
 

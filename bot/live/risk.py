@@ -33,9 +33,10 @@ class RiskManager:
         # error in the bot can never loosen the loss limit.
         self.external_realized = external_realized
 
-    def check(self) -> str | None:
-        """None if a new bet of `stake_usd` is allowed, otherwise the reason it is not."""
+    def check(self, stake_usd: float | None = None) -> str | None:
+        """None if a new bet of `stake_usd` (default: limits.stake_usd) is allowed, else the reason."""
         lim = self.limits
+        stake = lim.stake_usd if stake_usd is None else stake_usd
         if lim.kill_switch_path.exists():
             return f"kill switch ({lim.kill_switch_path} exists)"
         s = self.journal.day_stats(floor_to(self._clock(), DAY_MS))
@@ -47,8 +48,8 @@ class RiskManager:
         ext = self.external_realized()
         if ext is not None:
             realized = min(realized, ext)
-        worst = -realized + s.open_stake_usd + lim.stake_usd
+        worst = -realized + s.open_stake_usd + stake
         if worst > lim.max_daily_loss_usd:
             return (f"daily loss limit: realized {realized:+.2f}$, open {s.open_stake_usd:.2f}$, "
-                    f"next bet {lim.stake_usd:.2f}$ could reach -{worst:.2f}$ > -{lim.max_daily_loss_usd:.2f}$")
+                    f"next bet {stake:.2f}$ could reach -{worst:.2f}$ > -{lim.max_daily_loss_usd:.2f}$")
         return None

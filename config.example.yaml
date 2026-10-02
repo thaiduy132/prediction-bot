@@ -44,7 +44,7 @@ data:
   book_path: data/book.sqlite   # mẫu order book 1 giây/lần, ghi bằng `data record` hoặc `ui`
 
 backtest:
-  strategy: momentum        # momentum | reversal | always_up | book | momentum_book | value
+  strategy: momentum        # momentum | reversal | always_up | book | momentum_book | value | momentum_value
   decision_s: 270           # đặt lệnh sau khi vòng mở 270s (còn 30s)
   min_move_bps: 1.0         # momentum/reversal: bỏ qua nếu |biến động| nhỏ hơn
   # !!! PHẢI ĐỐI CHIẾU tỷ lệ thắng thực của thị trường (lãi ròng trên 1 đơn vị cược khi thắng).
@@ -59,6 +59,7 @@ backtest:
   calibration_path: data/calibration.json   # tạo bằng `python -m bot data calibrate`
   min_edge: 0.03            # lãi kỳ vọng tối thiểu trên 1 đơn vị cược, sau phí
   min_samples: 100          # bỏ qua nhóm |z| có ít hơn N vòng khi hiệu chỉnh
+  momentum_value_min_ev: 0.0   # momentum_value: chỉ theo đà khi lời kỳ vọng (phí thật) >= mức này
   # chiến lược order book (cần dữ liệu đã ghi bằng `python -m bot data record`)
   book_levels: 10           # 1 | 5 | 10 | 20 mức giá dùng tính imbalance
   book_window_s: 10         # lấy trung bình imbalance trong N giây cuối
@@ -83,14 +84,20 @@ live:
   baw_path: baw
   chain_id: 56                  # BNB Smart Chain (Predict.fun)
   stake_usd: 1.0                # tiền cược mỗi lệnh
+  # Tăng cược theo vốn: số dư >= vốn gốc x2 thì cược x1,5; x4 thì x2,25...; số dư giảm lại thì cược giảm theo.
+  scale_base_capital_usd: null   # vốn gốc (null = tắt, cược cố định)
+  scale_step_multiple: 2.0
+  scale_factor: 1.5
+  max_stake_usd: 5.0            # trần tiền cược mỗi lệnh
   max_daily_loss_usd: 3.0       # lỗ tối đa/ngày (tính cả lệnh đang mở như đã thua)
   max_bets_per_day: 20
   max_open_positions: 1
-  slippage_bps: 200
+  slippage_bps: 500             # 5%: với 2%, lệnh hay FAILED đúng lúc giá chạy theo hướng có lợi
   max_price_slippage: 0.02      # bỏ lệnh nếu giá báo thật tệ hơn giá lúc quyết định quá mức này
   deadline_ms: 5000             # bỏ lệnh nếu không gửi được trong 5s sau quyết định
   max_retries: 3                # Binance báo FAILED thì đặt lại (báo giá mới), tối đa 3 lần
   retry_window_s: 60            # không đặt lại nếu đã quá 60s sau lúc quyết định
+  retry_max_price: 0.85         # khi đặt lại: momentum không mua đắt hơn mức này (value tự tính lại lợi thế)
   kill_switch_path: data/STOP   # tạo file này để dừng đặt lệnh ngay lập tức
   journal_path: data/live.sqlite
 

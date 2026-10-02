@@ -17,7 +17,7 @@ from bot.backtest.calibration import SIGMA_WINDOW_S
 from bot.backtest.engine import BacktestResult, Trade, decide_entry
 from bot.backtest.pricing import bet_pnl
 from bot.backtest.stats import summarize
-from bot.backtest.strategy import Side, Strategy
+from bot.backtest.strategy import RoundContext, Side, Strategy, accept_retry
 from bot.data.book_store import BookSample
 from bot.data.odds_store import OddsSample
 from bot.models import Kline
@@ -91,6 +91,31 @@ class PaperTrader:
             self.times[r.round_open] = (r.opened_at, r.settled_at)
 
     # ---- inputs ---------------------------------------------------------------------
+
+    def current_context(self, round_open: int) -> RoundContext | None:
+        """The round as it stands now (latest closed second), for re-deciding on a retry."""
+        last = max((t for t in self._seconds if round_open <= t < round_open + self.step), default=None)
+        if last is None:
+            return None
+        decision_time = last + 1000
+        recent = [self._seconds[t] for t in range(round_open, decision_time, 1000) if t in self._seconds]
+        px = self._round_open_px.get(round_open)
+        if px is None and round_open in self._seconds:
+            px = self._seconds[round_open].open
+        if px is None or not recent:
+            return None
+        lookback = [self._seconds[t] for t in range(decision_time - SIGMA_WINDOW_S * 1000, decision_time, 1000)
+                    if t in self._seconds]
+        quotes = [q for q in self._odds if q.round_start == round_open]
+        return RoundContext(round_open, px, decision_time, recent, [b for b in self._book if b.ts < decision_time],
+                            lookback, quotes[-1] if quotes else None)
+
+    def recheck(self, bet: OpenBet, price: float, max_price: float) -> str | None:
+        """Hook for the live executor: is buying `bet.side` at `price` still a good decision now?"""
+        ctx = self.current_context(bet.round_open)
+        if ctx is None:
+            return "no fresh market data for this round"
+        return accept_retry(self.strategy, ctx, bet.side, price, max_price)
 
     def seed_seconds(self, klines: list[Kline]) -> None:
         """Store past closed 1s candles (e.g. history loaded at startup) without deciding on them,

@@ -382,7 +382,9 @@ function renderLive(L) {
   $('lvTitle').textContent = live ? 'Live · real money' : 'Shadow · real quotes, no orders';
   const st = L.stopped ? ['STOPPED', 'bad'] : L.blocked ? ['BLOCKED: ' + L.blocked, 'bad'] : [live ? 'TRADING' : 'SHADOW', 'ok'];
   $('lvState').textContent = st[0]; $('lvState').className = 'pill ' + st[1];
-  $('lvLimits').textContent = `${L.stake_usd}$/bet · max loss ${L.limits.max_daily_loss_usd}$/day · max ${L.limits.max_bets_per_day} bets/day`;
+  const sc = L.scaling || {};
+  const scTxt = sc.base_capital_usd ? ` (tier ${sc.tier}` + (sc.next_step_at_usd ? `, next step at ${fmt(sc.next_step_at_usd, 2)}$` : ', at the cap') + ')' : '';
+  $('lvLimits').textContent = `${fmt(L.stake_usd, 2)}$/bet${scTxt} · max loss ${L.limits.max_daily_loss_usd}$/day · max ${L.limits.max_bets_per_day} bets/day`;
   $('lvStop').textContent = L.stopped ? 'Resume orders' : 'Stop new orders';
   $('lvStop').className = 'btn ' + (L.stopped ? 'go' : 'stop');
   $('lvBal').textContent = a.usdt == null ? '—' : fmt(a.usdt, 2) + ' $';

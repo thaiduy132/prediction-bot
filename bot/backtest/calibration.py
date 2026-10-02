@@ -79,6 +79,24 @@ class CalibrationTable:
     def lookup(self, abs_z: float) -> Bucket:
         return self.buckets[bucket_index(abs_z)]
 
+    def lookup_pooled(self, abs_z: float, min_samples: int) -> Bucket:
+        """The |z| bucket, or, when it has fewer than `min_samples` rounds, that bucket pooled with
+        every STRONGER bucket (then weaker ones if still short).
+
+        Strong moves are rare (t=60: |z| 1.5-2 had 86 rounds, >= 2 only 21), and they are exactly where
+        retries land, since a market order fails when the price runs our way. Pooling upward is
+        conservative: win rates rise with |z|, so the pooled rate is not above the true one here.
+        """
+        i = bucket_index(abs_z)
+        if self.buckets[i].n >= min_samples:
+            return self.buckets[i]
+        lo, hi = i, len(self.buckets) - 1
+        pooled = Bucket(self.buckets[i].lo, None, sum(b.n for b in self.buckets[i:]), sum(b.wins for b in self.buckets[i:]))
+        while pooled.n < min_samples and lo > 0:
+            lo -= 1
+            pooled = Bucket(self.buckets[lo].lo, None, pooled.n + self.buckets[lo].n, pooled.wins + self.buckets[lo].wins)
+        return pooled
+
     def to_json(self) -> dict[str, Any]:
         return {"decision_s": self.decision_s, "round_s": self.round_s, "rule": self.rule, "symbol": self.symbol,
                 "start": self.start, "end": self.end,

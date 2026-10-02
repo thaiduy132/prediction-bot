@@ -22,6 +22,7 @@ from bot.backtest.strategy import Side
 from bot.live.baw import BawClient, BawError
 from bot.live.journal import LiveJournal
 from bot.live.risk import RiskManager
+from bot.live.sizing import StakeScaling
 from bot.logging_setup import log_event
 from bot.paper.trader import OpenBet
 from bot.settlement import Outcome
@@ -70,6 +71,7 @@ class ExecConfig:
     # Binance marks some MARKET orders FAILED ("Failed to execute the market order", ~12s after
     # sending, nothing spent). Such an order is retried with a fresh quote, within this window.
     max_retries: int = 3
+    retry_max_price: float = 0.85  # strategies without their own retry rule: never pay more than this
     retry_window_ms: int = 60_000  # no new attempt later than this after the decision
     fill_poll_ms: int = 2_000  # how often to ask Binance whether the order filled
     fill_timeout_ms: int = 30_000  # stop asking after this; the reconcile loop takes over
@@ -129,6 +131,9 @@ class LiveExecutor:
                                         "today_realized": None, "updated_at": None, "error": None}
         self._outcomes: dict[int, Outcome] = {}  # closed rounds seen, for orders confirmed filled late
         self.position: dict[str, Any] | None = None  # open real position (refresh_position)
+        # Re-decides a retry with fresh data (PaperTrader.recheck): (bet, new price, cap) -> reason or None.
+        self.recheck: Callable[[OpenBet, float, float], str | None] | None = None
+        self.scaling = StakeScaling(cfg.stake_usd)  # replaced by the CLI when scaling is configured
         self.pending_sell: dict[str, Any] | None = None  # sell quote waiting for the user's confirmation
         if hasattr(risk, "external_realized"):
             risk.external_realized = lambda: self.account.get("today_realized")
@@ -222,11 +227,24 @@ class LiveExecutor:
             log_event(log, "live.crash", logging.ERROR, round_open=bet.round_open, error=repr(e))
             self._act(bet.round_open, "failed", f"unexpected error: {e!r}")
 
+    def equity_usd(self) -> float | None:
+        """Wallet USDT (Binance, refreshed every minute) plus the stake still tied up in open orders."""
+        usdt = self.account.get("usdt")
+        if usdt is None:
+            return None
+        from bot.live.risk import DAY_MS
+        from bot.timeutil import floor_to
+        return usdt + self.journal.day_stats(floor_to(self._clock(), DAY_MS)).open_stake_usd
+
+    def current_stake(self) -> float:
+        return self.scaling.stake(self.equity_usd())
+
     async def execute(self, bet: OpenBet) -> None:
         """Send the order; if Binance fails it, retry with a fresh quote up to `max_retries` times."""
         n = self.cfg.max_retries
+        stake = self.current_stake()  # one size for the first try and its retries
         for attempt in range(n + 1):
-            row = await self._attempt(bet, attempt)
+            row = await self._attempt(bet, attempt, stake)
             if row is None or not self.cfg.live:
                 return  # not sent (skipped, failed before sending) or shadow
             status, error = await self._wait_fill(row)
@@ -241,19 +259,20 @@ class LiveExecutor:
                 return
             self._act(bet.round_open, "retry", f"order FAILED ({error}); retry {attempt + 1}/{n} with a fresh quote")
 
-    async def _attempt(self, bet: OpenBet, attempt: int) -> int | None:
+    async def _attempt(self, bet: OpenBet, attempt: int, stake: float | None = None) -> int | None:
         """One quote (+ order when live). Returns the journal row id if an order was sent."""
         side = bet.side.value
+        stake = self.cfg.stake_usd if stake is None else stake
         tag = f"retry {attempt}/{self.cfg.max_retries}: " if attempt else ""
-        reason = self.risk.check() if self.cfg.live else None
+        reason = self.risk.check(stake) if self.cfg.live else None
         if reason:
-            self.journal.add(bet.round_open, self.mode, side, self.cfg.stake_usd, "skipped",
+            self.journal.add(bet.round_open, self.mode, side, stake, "skipped",
                              decided_price=bet.entry_price, reason=tag + reason)
             self._act(bet.round_open, "skipped", tag + reason)
             return None
         topic = await self.topic(bet.round_open)
         token = None if topic is None else topic.tokens.get(side)
-        row = self.journal.add(bet.round_open, self.mode, side, self.cfg.stake_usd, "skipped",
+        row = self.journal.add(bet.round_open, self.mode, side, stake, "skipped",
                                token_id=token, decided_price=bet.entry_price, reason=tag.strip(" :") or None)
         if topic is None or token is None:
             self.journal.update(row, reason=tag + "round not found on Binance")
@@ -266,7 +285,7 @@ class LiveExecutor:
             self._act(bet.round_open, "skipped", "Binance and Predict.fun token ids differ")
             return None
         try:
-            q = await self.baw.quote(self.cfg.chain_id, token, "BUY", self.cfg.stake_usd,
+            q = await self.baw.quote(self.cfg.chain_id, token, "BUY", stake,
                                      topic_id=topic.topic_id, slippage_bps=self.cfg.slippage_bps)
         except BawError as e:
             self.journal.update(row, status="failed", reason=f"{tag}quote: {e}")
@@ -278,8 +297,16 @@ class LiveExecutor:
             self.journal.update(row, status="failed", reason="could not read quoteId/averagePrice from the reply")
             self._act(bet.round_open, "failed", "unreadable quote (raw JSON is in the journal)")
             return None
-        if bet.entry_price is not None and price > bet.entry_price + self.cfg.max_price_slippage:
-            # retries keep the ORIGINAL decision price as the limit: the edge was measured there
+        if attempt > 0 and self.recheck is not None:
+            # A retry is a NEW decision: the price usually moved because the market moved our way
+            # (that is why the market order failed), so judge it on the current situation.
+            why = self.recheck(bet, price, self.cfg.retry_max_price)
+            if why:
+                msg = f"{tag}{why}"
+                self.journal.update(row, status="skipped", reason=msg)
+                self._act(bet.round_open, "skipped", msg)
+                return None
+        elif bet.entry_price is not None and price > bet.entry_price + self.cfg.max_price_slippage:
             msg = f"{tag}price moved {bet.entry_price:.3f} -> {price:.3f}"
             self.journal.update(row, status="skipped", reason=msg)
             self._act(bet.round_open, "skipped", msg)
@@ -291,7 +318,7 @@ class LiveExecutor:
             self._act(bet.round_open, "skipped", f"{tag}too late ({late} ms)")
             return None
         if not self.cfg.live:
-            self._act(bet.round_open, "quoted", f"{side} {self.cfg.stake_usd}$ @ {price:.3f} fee {fee} (shadow)")
+            self._act(bet.round_open, "quoted", f"{side} {stake}$ @ {price:.3f} fee {fee} (shadow)")
             return None
 
         # ---- real money from here -------------------------------------------------------------
@@ -303,7 +330,7 @@ class LiveExecutor:
             return None
         oid = find_key(o, "orderId", "order_id", "id")
         self.journal.update(row, status="submitted", order_id=None if oid is None else str(oid), order_json=o)
-        self._act(bet.round_open, "submitted", f"{tag}{side} {self.cfg.stake_usd}$ @ ~{price:.3f} order {oid} "
+        self._act(bet.round_open, "submitted", f"{tag}{side} {stake}$ @ ~{price:.3f} order {oid} "
                                                "(waiting for Binance to confirm the fill)")
         return row if oid is not None else None
 
@@ -578,10 +605,14 @@ class LiveExecutor:
         s = self.journal.day_stats(floor_to(self._clock(), DAY_MS))
         lim = self.risk.limits
         return {
-            "mode": self.mode, "stake_usd": self.cfg.stake_usd,
+            "mode": self.mode, "stake_usd": self.current_stake(),
+            "scaling": {"base_stake_usd": self.scaling.base_stake_usd, "base_capital_usd": self.scaling.base_capital_usd,
+                        "tier": self.scaling.tier(self.equity_usd()), "equity_usd": self.equity_usd(),
+                        "next_step_at_usd": self.scaling.next_threshold(self.equity_usd()),
+                        "max_stake_usd": self.scaling.max_stake_usd},
             "limits": {"max_daily_loss_usd": lim.max_daily_loss_usd, "max_bets_per_day": lim.max_bets_per_day},
             "today": {"bets": s.bets, "realized_pnl_usd": round(s.realized_pnl_usd, 4), "open": s.open_count},
-            "blocked": self.risk.check() if self.cfg.live else None,
+            "blocked": self.risk.check(self.current_stake()) if self.cfg.live else None,
             "stopped": self.risk.limits.kill_switch_path.exists(),
             "account": self.account,
             "position": self.position_view(odds),
